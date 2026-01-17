@@ -15,6 +15,14 @@ interface Context {
 const context = Context.create<Context>("instance")
 const cache = createLruCache<string, Promise<Context>>({
   maxEntries: 20,
+  onEvict: async (_key, value) => {
+    const ctx = await value.catch(() => null)
+    if (ctx) {
+      await context.provide(ctx, async () => {
+        await State.dispose(ctx.directory)
+      })
+    }
+  },
 })
 
 const disposal = {
