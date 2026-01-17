@@ -13,6 +13,20 @@ import { ShareNext } from "@/share/share-next"
 import { Snapshot } from "../snapshot"
 import { Truncate } from "../tool/truncation"
 
+const commandSubscription = Instance.state(
+  () => {
+    const unsubscribe = Bus.subscribe(Command.Event.Executed, async (payload) => {
+      if (payload.properties.name === Command.Default.INIT) {
+        await Project.setInitialized(Instance.project.id)
+      }
+    })
+    return { unsubscribe }
+  },
+  async (state) => {
+    state.unsubscribe()
+  },
+)
+
 export async function InstanceBootstrap() {
   Log.Default.info("bootstrapping", { directory: Instance.directory })
   await Plugin.init()
@@ -24,10 +38,5 @@ export async function InstanceBootstrap() {
   Vcs.init()
   Snapshot.init()
   Truncate.init()
-
-  Bus.subscribe(Command.Event.Executed, async (payload) => {
-    if (payload.properties.name === Command.Default.INIT) {
-      await Project.setInitialized(Instance.project.id)
-    }
-  })
+  commandSubscription()
 }
