@@ -5,6 +5,7 @@ import { State } from "./state"
 import { iife } from "@/util/iife"
 import { GlobalBus } from "@/bus/global"
 import { Filesystem } from "@/util/filesystem"
+import { createLruCache } from "@/util/cache"
 
 interface Context {
   directory: string
@@ -12,7 +13,9 @@ interface Context {
   project: Project.Info
 }
 const context = Context.create<Context>("instance")
-const cache = new Map<string, Promise<Context>>()
+const cache = createLruCache<string, Promise<Context>>({
+  maxEntries: 20,
+})
 
 const disposal = {
   all: undefined as Promise<void> | undefined,
