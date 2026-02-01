@@ -1,5 +1,6 @@
 import { createMemo, createSignal, For } from "solid-js"
 import { DEFAULT_THEMES, useTheme } from "@tui/context/theme"
+import { Locale } from "@/util/locale"
 
 const themeCount = Object.keys(DEFAULT_THEMES).length
 const themeTip = `Use {highlight}/theme{/highlight} or {highlight}Ctrl+X T{/highlight} to switch between ${themeCount} built-in themes`
@@ -35,11 +36,11 @@ export function Tips() {
   const parts = parse(TIPS[Math.floor(Math.random() * TIPS.length)])
 
   return (
-    <box flexDirection="row" maxWidth="100%">
+    <box flexDirection="row" width="100%">
       <text flexShrink={0} style={{ fg: theme.warning }}>
         ● Tip{" "}
       </text>
-      <text flexShrink={1}>
+      <text flexGrow={1} wrapMode="word">
         <For each={parts}>
           {(part) => <span style={{ fg: part.highlight ? theme.text : theme.textMuted }}>{part.text}</span>}
         </For>
