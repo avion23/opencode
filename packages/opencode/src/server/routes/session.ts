@@ -579,6 +579,17 @@ export const SessionRoutes = lazy(() =>
           sessionID: c.req.valid("param").sessionID,
           limit: query.limit,
         })
+        const acceptEncoding = c.req.header("accept-encoding") ?? ""
+        if (acceptEncoding.includes("gzip")) {
+          const json = JSON.stringify(messages)
+          const compressed = Bun.gzipSync(json)
+          return new Response(compressed, {
+            headers: {
+              "Content-Type": "application/json",
+              "Content-Encoding": "gzip",
+            },
+          })
+        }
         return c.json(messages)
       },
     )
