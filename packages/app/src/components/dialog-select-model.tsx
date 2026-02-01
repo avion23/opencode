@@ -1,13 +1,11 @@
 import { Popover as Kobalte } from "@kobalte/core/popover"
-import { Component, ComponentProps, createEffect, createMemo, JSX, onCleanup, Show, ValidComponent } from "solid-js"
+import { Accessor, Component, ComponentProps, createEffect, createMemo, JSX, onCleanup, Show, ValidComponent } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useLocal } from "@/context/local"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { popularProviders } from "@/hooks/use-providers"
-import { Button } from "@opencode-ai/ui/button"
 import { IconButton } from "@opencode-ai/ui/icon-button"
 import { Tag } from "@opencode-ai/ui/tag"
-import { Dialog } from "@opencode-ai/ui/dialog"
 import { List } from "@opencode-ai/ui/list"
 import { Tooltip } from "@opencode-ai/ui/tooltip"
 import { DialogSelectProvider } from "./dialog-select-provider"
@@ -93,6 +91,8 @@ export function ModelSelectorPopover<T extends ValidComponent = "div">(props: {
   children?: JSX.Element
   triggerAs?: T
   triggerProps?: ComponentProps<T>
+  externalOpen?: Accessor<boolean>
+  onExternalOpenHandled?: () => void
 }) {
   const [store, setStore] = createStore<{
     open: boolean
@@ -117,6 +117,13 @@ export function ModelSelectorPopover<T extends ValidComponent = "div">(props: {
     dialog.show(() => <DialogSelectProvider />)
   }
   const language = useLanguage()
+
+  createEffect(() => {
+    if (props.externalOpen?.()) {
+      setStore("open", true)
+      props.onExternalOpenHandled?.()
+    }
+  })
 
   createEffect(() => {
     if (!store.open) return
@@ -243,32 +250,3 @@ export function ModelSelectorPopover<T extends ValidComponent = "div">(props: {
   )
 }
 
-export const DialogSelectModel: Component<{ provider?: string }> = (props) => {
-  const dialog = useDialog()
-  const language = useLanguage()
-
-  return (
-    <Dialog
-      title={language.t("dialog.model.select.title")}
-      action={
-        <Button
-          class="h-7 -my-1 text-14-medium"
-          icon="plus-small"
-          tabIndex={-1}
-          onClick={() => dialog.show(() => <DialogSelectProvider />)}
-        >
-          {language.t("command.provider.connect")}
-        </Button>
-      }
-    >
-      <ModelList provider={props.provider} onSelect={() => dialog.close()} />
-      <Button
-        variant="ghost"
-        class="ml-3 mt-5 mb-6 text-text-base self-start"
-        onClick={() => dialog.show(() => <DialogManageModels />)}
-      >
-        {language.t("dialog.model.manage")}
-      </Button>
-    </Dialog>
-  )
-}

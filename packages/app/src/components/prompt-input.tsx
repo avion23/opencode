@@ -59,6 +59,12 @@ import { Binary } from "@opencode-ai/util/binary"
 import { showToast } from "@opencode-ai/ui/toast"
 import { base64Encode } from "@opencode-ai/util/encode"
 
+const [modelSelectorOpen, setModelSelectorOpen] = createSignal(false)
+
+export function openModelSelector() {
+  setModelSelectorOpen(true)
+}
+
 const ACCEPTED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"]
 const ACCEPTED_FILE_TYPES = [...ACCEPTED_IMAGE_TYPES, "application/pdf"]
 
@@ -1937,7 +1943,12 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                     title={language.t("command.model.choose")}
                     keybind={command.keybind("model.choose")}
                   >
-                    <ModelSelectorPopover triggerAs={Button} triggerProps={{ variant: "ghost" }}>
+                    <ModelSelectorPopover
+                      triggerAs={Button}
+                      triggerProps={{ variant: "ghost" }}
+                      externalOpen={modelSelectorOpen}
+                      onExternalOpenHandled={() => setModelSelectorOpen(false)}
+                    >
                       <Show when={local.model.current()?.provider?.id}>
                         <ProviderIcon id={local.model.current()!.provider.id as IconName} class="size-4 shrink-0" />
                       </Show>

@@ -44,7 +44,7 @@ import { findLast } from "@opencode-ai/util/array"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { DialogSelectFile } from "@/components/dialog-select-file"
 import FileTree from "@/components/file-tree"
-import { DialogSelectModel } from "@/components/dialog-select-model"
+import { openModelSelector } from "@/components/prompt-input"
 import { DialogSelectMcp } from "@/components/dialog-select-mcp"
 import { DialogFork } from "@/components/dialog-fork"
 import { useCommand } from "@/context/command"
@@ -787,7 +787,7 @@ export default function Page() {
       category: language.t("command.category.model"),
       keybind: "mod+'",
       slash: "model",
-      onSelect: () => dialog.show(() => <DialogSelectModel />),
+      onSelect: () => openModelSelector(),
     },
     {
       id: "mcp.toggle",
