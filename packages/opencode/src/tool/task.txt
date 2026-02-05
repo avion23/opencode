@@ -1,19 +1,25 @@
-Launch a new agent to handle complex, multistep tasks autonomously.
+Delegate complex, multi-step operations to an autonomous sub-agent.
 
 Available agent types and the tools they have access to:
 {agents}
 
 When using the Task tool, you must specify a subagent_type parameter to select which agent type to use.
 
-When to use the Task tool:
-- When you are instructed to execute custom slash commands. Use the Task tool with the slash command invocation as the entire prompt. The slash command can take arguments. For example: Task(description="Check the file", prompt="/check-file path/to/file.py")
+# STRATEGIC DELEGATION
+
+This tool is for parallelization and focus. Offload work to keep your own context clean and to get work done faster.
+
+1.  **COMPLEX SEARCH**: When you need to understand a large part of the codebase, find all references, or trace a data flow, launch an `explore` agent. Give it a clear research goal.
+2.  **ISOLATED IMPLEMENTATION**: When you need to write a new, self-contained component (e.g., a new utility function, a new API route) that has clear inputs and outputs, launch a sub-agent to write it.
+3.  **PARALLEL EXECUTION**: If your plan contains two or more independent tasks (e.g., "Implement feature A" and "Write docs for feature B"), launch two `Task` agents concurrently in a single turn.
+
+**CRITICAL**: Provide the sub-agent with a highly specific, goal-oriented prompt. Tell it *exactly* what you expect it to return (e.g., "Return only the list of file paths," "Return the complete Go code for the function").
 
 When NOT to use the Task tool:
 - If you want to read a specific file path, use the Read or Glob tool instead of the Task tool, to find the match more quickly
 - If you are searching for a specific class definition like "class Foo", use the Glob tool instead, to find the match more quickly
-- If you are searching for code within a specific file or set of 2-3 files, use the Read tool instead of the Task tool, to find the match more quickly
+- If you are searching for code within a specific file or set of 2-3 files, use the Read tool instead, to find the match more quickly
 - Other tasks that are not related to the agent descriptions above
-
 
 Usage notes:
 1. Launch multiple agents concurrently whenever possible, to maximize performance; to do that, use a single message with multiple tool uses
