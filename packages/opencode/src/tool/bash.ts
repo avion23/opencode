@@ -144,6 +144,82 @@ export const BashTool = Tool.define("bash", async () => {
         }
       }
 
+      // Check for high-risk destructive commands that operate outside workspace
+      const workspacePath = Instance.directory
+      const commandLower = params.command.toLowerCase()
+
+      // Pattern groups for different risk levels
+      const systemDestructionPatterns = [
+        /rm\s+-rf\s*\/($|\s)/, // rm -rf /
+        /rm\s+-rf\s*\/System/, // rm -rf /System
+        /rm\s+-rf\s*\/Users/, // rm -rf /Users
+        /rm\s+-rf\s*\/home($|\s)/, // rm -rf /home
+        /chmod\s+-R\s*777\s*\//, // chmod -R 777 /
+        /mkfs\./, // format filesystems
+        /dd\s+if=.*of=\/dev/, // dd to devices
+        />\s*\/etc\/passwd/, // overwrite system files
+        />\s*\/etc\/shadow/,
+        />\s*\/etc\/hosts/,
+      ]
+
+      const gitDestructivePatterns = [
+        /git\s+push\s+.*--force/, // git push --force
+        /git\s+push\s+.*-f\s/, // git push -f
+        /git\s+reset\s+--hard\s+(main|master)/, // reset on main/master
+        /git\s+clean\s+-fd/, // git clean -fd
+      ]
+
+      const broadDeletionPatterns = [
+        /rm\s+-rf\s+[^/\s]*$/, // rm -rf without path (dangerous in wrong dir)
+        /find\s+.*-delete/, // find with delete
+        /find\s+.*-exec\s+rm/, // find with rm
+      ]
+
+      const allHighRiskPatterns = [...systemDestructionPatterns, ...gitDestructivePatterns, ...broadDeletionPatterns]
+
+      const isHighRisk = allHighRiskPatterns.some((pattern) => pattern.test(commandLower))
+
+      // Additional check: ensure rm -rf targets are within workspace
+      if (commandLower.includes("rm") && commandLower.includes("-rf")) {
+        const rmMatch = params.command.match(/rm\s+-rf\s+(\S+)/)
+        if (rmMatch) {
+          const target = rmMatch[1]
+          const resolvedTarget = path.resolve(cwd, target)
+          // Check if target is outside workspace or is root/system path
+          if (
+            !resolvedTarget.startsWith(workspacePath) ||
+            target === "/" ||
+            target.startsWith("/System") ||
+            target.startsWith("/Users") ||
+            target.startsWith("/etc")
+          ) {
+            await ctx.ask({
+              permission: "high_risk_command",
+              patterns: [params.command],
+              always: [],
+              metadata: {
+                warning: `This deletion targets '${target}' which may be outside the project workspace. Please verify scope.`,
+                command: params.command,
+                workspace: workspacePath,
+                resolvedTarget,
+              },
+            })
+          }
+        }
+      } else if (isHighRisk) {
+        await ctx.ask({
+          permission: "high_risk_command",
+          patterns: [params.command],
+          always: [],
+          metadata: {
+            warning:
+              "This command appears to be high-risk or destructive. Please review carefully and confirm scope is limited to project workspace.",
+            command: params.command,
+            workspace: workspacePath,
+          },
+        })
+      }
+
       if (directories.size > 0) {
         const globs = Array.from(directories).map((dir) => path.join(dir, "*"))
         await ctx.ask({
