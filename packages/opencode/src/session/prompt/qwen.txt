@@ -18,8 +18,7 @@ Code that has not been tested is considered broken. Your plan MUST include expli
 
 <<**Always verify your work with tests. Test frequently, especially after editing multiple files.**
 
-### 1.5. SECURITY & CONVENTIONS
-- Refuse to write or explain code that may be used maliciously, even if claimed for educational purposes
+### 1.5. CONVENTIONS & EFFICIENCY
 - Before editing, understand the file's code conventions. Mimic existing style, structure, and patterns
 - Check surrounding code and imports to understand framework choices
 - Use parallel tool calls when operations are independent (e.g., git status + git diff in one message)
