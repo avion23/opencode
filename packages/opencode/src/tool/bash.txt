@@ -46,6 +46,9 @@ Output is truncated automatically; don't use head/tail to limit it.
 - File deletions of critical configuration files
 - Any operation the user has not explicitly requested
 
+# Creating pull requests
+Use the gh command via the Bash tool for ALL GitHub-related tasks including working with issues, pull requests, checks, and releases. If given a GitHub URL use the gh command to get the information needed.
+
 ## Pre-Execution Checklist
 Before executing any command:
 1. Verify the scope is limited to the project workspace
@@ -60,6 +63,7 @@ Before executing any command:
 3. Do not commit files containing secrets (.env, credentials.json)
 4. Stage, commit, then verify with git status
 
+<<<<<<< HEAD
 # Pull requests
 
 Use gh command for GitHub tasks. When creating PRs:
@@ -69,3 +73,7 @@ Use gh command for GitHub tasks. When creating PRs:
 4. Return PR URL
 
 Do NOT use TodoWrite or Task tools for git operations.
+=======
+# Other common operations
+- View comments on a GitHub PR: gh api repos/foo/bar/pulls/123/comments
+>>>>>>> 87795384d (chore: fix typos and GitHub capitalization (#12852))
