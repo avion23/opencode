@@ -99,7 +99,7 @@ export namespace Pty {
         } catch {}
         for (const [key, ws] of session.subscribers.entries()) {
           try {
-            if (ws.data === key) ws.close()
+            if (ws.data === key || ws === key) ws.close()
           } catch {
             // ignore
           }
@@ -176,11 +176,6 @@ export namespace Pty {
           continue
         }
 
-        if (ws.data !== key) {
-          session.subscribers.delete(key)
-          continue
-        }
-
         try {
           ws.send(chunk)
         } catch {
@@ -199,7 +194,7 @@ export namespace Pty {
       session.info.status = "exited"
       for (const [key, ws] of session.subscribers.entries()) {
         try {
-          if (ws.data === key) ws.close()
+          if (ws.data === key || ws === key) ws.close()
         } catch {
           // ignore
         }
@@ -234,7 +229,7 @@ export namespace Pty {
     } catch {}
     for (const [key, ws] of session.subscribers.entries()) {
       try {
-        if (ws.data === key) ws.close()
+        if (ws.data === key || ws === key) ws.close()
       } catch {
         // ignore
       }
