@@ -745,26 +745,57 @@ export namespace Session {
 
   const UpdatePartInput = MessageV2.Part
 
-  export const updatePart = fn(UpdatePartInput, async (part) => {
-    const { id, messageID, sessionID, ...data } = part
-    const time = Date.now()
+  // Write coalescing: buffer updates in memory, flush periodically
+  // This prevents database lock contention during high-frequency updates
+  // (e.g., bash tool output streaming with 20+ concurrent sessions)
+  const partUpdateBuffer = new Map<string, ReturnType<typeof UpdatePartInput.parse>>()
+  let partFlushTimer: ReturnType<typeof setInterval> | undefined
+  const PART_FLUSH_INTERVAL = 100 // ms
+
+  function flushPartUpdates() {
+    if (partUpdateBuffer.size === 0) return
+    const updates = Array.from(partUpdateBuffer.values())
+    partUpdateBuffer.clear()
+
     Database.use((db) => {
-      db.insert(PartTable)
-        .values({
-          id,
-          message_id: messageID,
-          session_id: sessionID,
-          time_created: time,
-          data,
-        })
-        .onConflictDoUpdate({ target: PartTable.id, set: { data } })
-        .run()
-      Database.effect(() =>
-        Bus.publish(MessageV2.Event.PartUpdated, {
-          part: structuredClone(part),
-        }),
-      )
+      const time = Date.now()
+      for (const part of updates) {
+        const { id, messageID, sessionID, ...data } = part as any
+        db.insert(PartTable)
+          .values({
+            id,
+            message_id: messageID,
+            session_id: sessionID,
+            time_created: time,
+            data,
+          })
+          .onConflictDoUpdate({ target: PartTable.id, set: { data } })
+          .run()
+      }
     })
+  }
+
+  function schedulePartFlush() {
+    if (partFlushTimer) return
+    partFlushTimer = setInterval(() => {
+      flushPartUpdates()
+      if (partUpdateBuffer.size === 0 && partFlushTimer) {
+        clearInterval(partFlushTimer)
+        partFlushTimer = undefined
+      }
+    }, PART_FLUSH_INTERVAL)
+  }
+
+  export const updatePart = fn(UpdatePartInput, async (part) => {
+    // Immediately publish to bus for real-time TUI updates
+    Bus.publish(MessageV2.Event.PartUpdated, {
+      part: structuredClone(part),
+    })
+
+    // Buffer for batch database write (prevents lock contention)
+    partUpdateBuffer.set(part.id, part)
+    schedulePartFlush()
+
     return part
   })
 
