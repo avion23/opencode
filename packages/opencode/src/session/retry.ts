@@ -142,6 +142,17 @@ export function retryable(error: Err, provider: string) {
         },
       }
     }
+    // Hard daily quota caps (e.g. NaraRouter "Daily token quota reached...
+    // resets daily at 00:00 UTC") clear on a fixed schedule, not transiently.
+    // Retrying hangs until the reset boundary — surface immediately.
+    // Matches explicit exhaustion language only. Negation (not/no/hasn't) before
+    // the verb prevents a match. Each field is tested independently to avoid
+    // cross-field false positives (e.g. "quota remaining" + "limit exceeded").
+    const DAILY_QUOTA_RE =
+      /\bdaily\b[\s\S]{0,30}\b(quota|limit|cap)\b[\s\S]{0,30}\b(reached|exceeded|hit|exhausted|depleted)\b|\b(reached|exceeded|hit|exhausted|depleted)\b[\s\S]{0,10}\bdaily\b[\s\S]{0,30}\b(quota|limit|cap)\b|\b(quota|limit|cap)\b[\s\S]{0,20}\b(reached|exceeded|hit|exhausted|depleted)\b[\s\S]{0,20}\bfor today\b/i
+    const NEGATED_RE = /\b(not|no|hasn't|haven't|didn't|won't|cannot|can't)\b[\s\S]{0,15}\b(reached|exceeded|hit|exhausted|depleted)\b/i
+    const fields = [error.data.responseBody, error.data.message].filter((x): x is string => Boolean(x))
+    if (fields.some((f) => DAILY_QUOTA_RE.test(f) && !NEGATED_RE.test(f))) return undefined
     return { message: error.data.message.includes("Overloaded") ? "Provider is overloaded" : error.data.message }
   }
 

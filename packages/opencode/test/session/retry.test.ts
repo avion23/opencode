@@ -425,6 +425,167 @@ describe("session.retry.retryable", () => {
       "Usage limit reached. It will reset in 15 minutes. To continue using this model now, enable usage from your available balance",
     )
   })
+
+  test("does not retry hard daily quota caps when only the message is specific", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Daily token quota reached for this model tier. It resets daily at 07:00 WIB (00:00 UTC).",
+        isRetryable: true,
+        statusCode: 429,
+        responseBody: JSON.stringify({
+          error: { type: "rate_limited", message: "Rate limit exceeded" },
+        }),
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toBeUndefined()
+  })
+
+  test("still retries transient rate limits without daily quota language", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Rate limit exceeded, please try again later",
+        isRetryable: true,
+        statusCode: 429,
+        responseBody: JSON.stringify({
+          error: { type: "rate_limited", message: "Rate limit exceeded, please try again later" },
+        }),
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toEqual({
+      message: "Rate limit exceeded, please try again later",
+    })
+  })
+
+  test("does not retry when daily quota is hit (responseBody-only match)", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Rate limit exceeded",
+        isRetryable: true,
+        statusCode: 429,
+        responseBody: JSON.stringify({
+          error: {
+            message: "Daily token quota reached for this model tier. It resets daily at 00:00 UTC.",
+          },
+        }),
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toBeUndefined()
+  })
+
+  test("does not retry quota reached for today", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Token quota reached for today. It resets at 00:00 UTC.",
+        isRetryable: true,
+        statusCode: 429,
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toBeUndefined()
+  })
+
+  test("still retries transient rate limits that mention resets daily without hit language", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Rate limit exceeded. Resets daily at midnight.",
+        isRetryable: true,
+        statusCode: 429,
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toEqual({
+      message: "Rate limit exceeded. Resets daily at midnight.",
+    })
+  })
+
+  test("retries when daily quota is mentioned but not exhausted", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message:
+          "Rate limit exceeded: per-minute request limit reached; retry after 60 seconds. Daily quota remaining: 950000 tokens.",
+        isRetryable: true,
+        statusCode: 429,
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toEqual({
+      message:
+        "Rate limit exceeded: per-minute request limit reached; retry after 60 seconds. Daily quota remaining: 950000 tokens.",
+    })
+  })
+
+  test("does not retry daily quota exhausted (synonym)", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Daily token quota exhausted. Resets at 00:00 UTC.",
+        isRetryable: true,
+        statusCode: 429,
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toBeUndefined()
+  })
+
+  test("does not retry daily cap depleted (synonym)", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Daily cap depleted for this model.",
+        isRetryable: true,
+        statusCode: 429,
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toBeUndefined()
+  })
+
+  test("retries when negation is present (quota not reached)", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Daily quota not reached, you still have remaining requests.",
+        isRetryable: true,
+        statusCode: 429,
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toEqual({
+      message: "Daily quota not reached, you still have remaining requests.",
+    })
+  })
+
+  test("does not cross-field match (quota remaining in responseBody + limit exceeded in message)", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Rate limit exceeded, please try again",
+        isRetryable: true,
+        statusCode: 429,
+        responseBody: JSON.stringify({
+          error: { message: "Daily quota remaining: 500 tokens" },
+        }),
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toEqual({
+      message: "Rate limit exceeded, please try again",
+    })
+  })
+
+  test("does not retry when only responseBody has exhaustion language", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Request failed",
+        isRetryable: true,
+        statusCode: 429,
+        responseBody: JSON.stringify({
+          error: { message: "Daily limit exceeded, resets tomorrow" },
+        }),
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toBeUndefined()
+  })
 })
 
 describe("session.message-v2.fromError", () => {
