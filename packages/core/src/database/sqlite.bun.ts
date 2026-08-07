@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite"
+import { Database, type Statement as BunStatement } from "bun:sqlite"
 import { drizzle } from "drizzle-orm/bun-sqlite"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
@@ -48,6 +48,19 @@ const make = (options: Config) =>
   Effect.gen(function* () {
     const native = (yield* Sqlite.Native) as Database
 
+    const statements = new Set<BunStatement>()
+    // bun:sqlite caches and reuses a statement per distinct SQL string, and
+    // only finalizes statements on GC, which can run after the connection
+    // closes and trigger sqlite misuse. Holding every statement here keeps it
+    // alive and finalizes it exactly once, in the finalizer below, before the
+    // native connection closes; the set is drained there and is bounded by the
+    // distinct SQL strings executed on this connection.
+    const prepare = (query: string) => {
+      const statement = native.query(query)
+      statements.add(statement)
+      return statement
+    }
+
     const compiler = Statement.makeCompilerSqlite(options.transformQueryNames)
     const transformRows = options.transformResultNames
       ? Statement.defaultTransforms(options.transformResultNames).array
@@ -55,7 +68,7 @@ const make = (options: Config) =>
 
     const run = (query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.withFiber<Array<Record<string, unknown>>, SqlError>((fiber) => {
-        const statement = native.query(query)
+        const statement = prepare(query)
         // @ts-ignore bun-types missing safeIntegers method, fixed in https://github.com/oven-sh/bun/pull/26627
         statement.safeIntegers(Context.get(fiber.context, Client.SafeIntegers))
         try {
@@ -71,7 +84,7 @@ const make = (options: Config) =>
 
     const runValues = (query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.withFiber<Array<unknown[]>, SqlError>((fiber) => {
-        const statement = native.query(query)
+        const statement = prepare(query)
         // @ts-ignore bun-types missing safeIntegers method, fixed in https://github.com/oven-sh/bun/pull/26627
         statement.safeIntegers(Context.get(fiber.context, Client.SafeIntegers))
         try {
@@ -84,6 +97,15 @@ const make = (options: Config) =>
           )
         }
       })
+
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        for (const statement of statements) {
+          statements.delete(statement)
+          statement.finalize()
+        }
+      }),
+    )
 
     const connection = identity<SqliteConnection>({
       execute(query, params, transformRows) {
@@ -166,7 +188,7 @@ const nativeLayer = (config: Config) =>
     }),
   )
 
-const sqliteLayer = (config: Config) => Layer.effect(Client.SqlClient, make(config))
+export const sqliteLayer = (config: Config) => Layer.effect(Client.SqlClient, make(config))
 
 const drizzleLayer = Layer.effect(
   Sqlite.Drizzle,
