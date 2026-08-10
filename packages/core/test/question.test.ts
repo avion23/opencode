@@ -117,7 +117,30 @@ describe("QuestionV2", () => {
       const service = yield* QuestionV2.Service
       const exit = yield* service.ask({ sessionID, questions: [] }).pipe(Effect.timeout("1 second"), Effect.exit)
       expect(Exit.isFailure(exit)).toBe(true)
-      if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("at least one question")
+      if (Exit.isFailure(exit)) {
+        // A typed error in the service's error channel, never a defect.
+        expect(exit.cause.reasons.some(Cause.isFailReason)).toBe(true)
+        expect(exit.cause.reasons.some(Cause.isDieReason)).toBe(false)
+        expect(Cause.squash(exit.cause)).toBeInstanceOf(QuestionV2.InvalidQuestionsError)
+        expect(Cause.pretty(exit.cause)).toContain("at least one question")
+      }
+      expect(yield* service.list()).toEqual([])
+    }),
+  )
+
+  it.effect("fails fast with a typed error when asked with a non-array instead of registering a dead request", () =>
+    Effect.gen(function* () {
+      const service = yield* QuestionV2.Service
+      const exit = yield* service
+        .ask({ sessionID, questions: {} as unknown as QuestionV2.Info[] })
+        .pipe(Effect.timeout("1 second"), Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        // A non-array must not bypass the guard and register a pending request.
+        expect(exit.cause.reasons.some(Cause.isFailReason)).toBe(true)
+        expect(exit.cause.reasons.some(Cause.isDieReason)).toBe(false)
+        expect(Cause.squash(exit.cause)).toBeInstanceOf(QuestionV2.InvalidQuestionsError)
+      }
       expect(yield* service.list()).toEqual([])
     }),
   )

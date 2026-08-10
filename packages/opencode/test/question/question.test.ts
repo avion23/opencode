@@ -128,8 +128,34 @@ it.instance(
         questions: [],
       }).pipe(Effect.timeout("1 second"), Effect.exit)
       expect(Exit.isFailure(exit)).toBe(true)
-      if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("at least one question")
+      if (Exit.isFailure(exit)) {
+        // A typed error in the service's error channel, never a defect.
+        expect(exit.cause.reasons.some(Cause.isFailReason)).toBe(true)
+        expect(exit.cause.reasons.some(Cause.isDieReason)).toBe(false)
+        expect(Cause.squash(exit.cause)).toBeInstanceOf(Question.InvalidQuestionsError)
+        expect(Cause.pretty(exit.cause)).toContain("at least one question")
+      }
       // An empty ask must not register a never-resolving pending request.
+      expect(yield* listEffect).toHaveLength(0)
+    }),
+  { git: true },
+)
+
+it.instance(
+  "ask - fails fast with a typed error when questions is not an array",
+  () =>
+    Effect.gen(function* () {
+      const exit = yield* askEffect({
+        sessionID: SessionID.make("ses_test"),
+        questions: {} as unknown as ReadonlyArray<Question.Info>,
+      }).pipe(Effect.timeout("1 second"), Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        // A non-array must not bypass the guard and register a pending request.
+        expect(exit.cause.reasons.some(Cause.isFailReason)).toBe(true)
+        expect(exit.cause.reasons.some(Cause.isDieReason)).toBe(false)
+        expect(Cause.squash(exit.cause)).toBeInstanceOf(Question.InvalidQuestionsError)
+      }
       expect(yield* listEffect).toHaveLength(0)
     }),
   { git: true },

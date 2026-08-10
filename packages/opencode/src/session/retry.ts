@@ -33,6 +33,13 @@ export const RETRY_JITTER_FACTOR = 0.25
 export const RETRY_MAX_DELAY_NO_HEADERS = 30_000 // 30 seconds
 export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for setTimeout
 export const RETRY_MAX_RETRIES = 5
+// Permanently-failing providers (e.g. persistent "server overloaded") must
+// surface an error to the caller instead of retrying forever, otherwise the
+// parent session blocks on background.wait() and sibling subagents never
+// finish. Attempt count bounds the common case; elapsed bounds providers that
+// send long retry-after headers.
+export const RETRY_MAX_ATTEMPTS = 8
+export const RETRY_MAX_ELAPSED_MS = 5 * 60_000 // 5 minutes
 
 const RETRYABLE_MESSAGE_PATTERNS = [
   /429|500|502|503|504|524/i,
@@ -250,9 +257,16 @@ export function policy(opts: {
   provider: string
   parse: (error: unknown) => Err
   set: (input: { attempt: number; message: string; action?: Retryable["action"]; next: number }) => Effect.Effect<void>
+  maxAttempts?: number
+  maxElapsedMs?: number
 }) {
+  const maxAttempts = opts.maxAttempts ?? RETRY_MAX_ATTEMPTS
+  const maxElapsedMs = opts.maxElapsedMs ?? RETRY_MAX_ELAPSED_MS
   return Schedule.fromStepWithMetadata(
     Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
+      // Cap retries so a persistently failing provider surfaces an error to the
+      // caller (the parent session) instead of hanging the turn forever.
+      if (meta.attempt > maxAttempts || meta.elapsed >= maxElapsedMs) return Cause.done(meta.attempt)
       const error = opts.parse(meta.input)
       const retry =
         meta.input instanceof EmptyResponseError ? { message: meta.input.message } : retryable(error, opts.provider)

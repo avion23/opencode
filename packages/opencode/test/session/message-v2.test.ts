@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { APICallError } from "ai"
 import { MessageV2 } from "../../src/session/message-v2"
+import { SessionRetry } from "../../src/session/retry"
 import { ProviderTransform } from "@/provider/transform"
 import type { Provider } from "@/provider/provider"
 
@@ -1551,6 +1552,122 @@ describe("session.message-v2.fromError", () => {
     const result = MessageV2.fromError(zlibError, { providerID, aborted: true })
 
     expect(result.name).toBe("MessageAbortedError")
+  })
+
+  test("derives status and code when the AI SDK error message is empty", () => {
+    const result = MessageV2.fromError(
+      new APICallError({
+        message: "",
+        url: "https://api.example.com/chat",
+        requestBodyValues: { messages: [] },
+        statusCode: 404,
+        responseHeaders: { authorization: "Bearer secret-token" },
+        responseBody: '{"error":{"message":"","code":"not_found"}}',
+        data: { error: { message: "", code: "not_found" } },
+      }),
+      { providerID },
+    )
+    expect(SessionV1.APIError.isInstance(result)).toBe(true)
+    const apiError = result as SessionV1.APIError
+    expect(apiError.data.message).toBe("Provider request failed with HTTP 404: not_found")
+    expect(apiError.data.statusCode).toBe(404)
+    expect(apiError.data.isRetryable).toBe(false)
+    expect(apiError.data.message).not.toContain("secret-token")
+  })
+
+  test("never surfaces the raw response body when no recognized message field exists", () => {
+    const result = MessageV2.fromError(
+      new APICallError({
+        message: "Unauthorized",
+        url: "https://api.example.com/chat",
+        requestBodyValues: { messages: [] },
+        statusCode: 401,
+        responseHeaders: { "content-type": "application/json" },
+        responseBody: JSON.stringify({ debug: { authorization: "Bearer TOP-SECRET" } }),
+        isRetryable: false,
+      }),
+      { providerID },
+    )
+    expect(SessionV1.APIError.isInstance(result)).toBe(true)
+    const apiError = result as SessionV1.APIError
+    // The message is the HTTP status text alone; the body (which echoes a
+    // credential) must never be appended to the surfaced message.
+    expect(apiError.data.message).toBe("Unauthorized")
+    expect(apiError.data.message).not.toContain("TOP-SECRET")
+    expect(apiError.data.message).not.toContain("authorization")
+  })
+
+  test("derives a non-empty message for whitespace-only AI SDK error messages", () => {
+    const result = MessageV2.fromError(
+      new APICallError({
+        message: "   ",
+        url: "https://api.example.com/chat",
+        requestBodyValues: { messages: [] },
+        statusCode: 429,
+        responseHeaders: { "retry-after": "7" },
+        responseBody: '{"error":{"code":"rate_limited"}}',
+        isRetryable: true,
+      }),
+      { providerID },
+    )
+    expect(SessionV1.APIError.isInstance(result)).toBe(true)
+    const apiError = result as SessionV1.APIError
+    expect(apiError.data.message).toBe("Provider request failed with HTTP 429: rate_limited")
+    expect(apiError.data.message.trim()).not.toBe("")
+  })
+
+  test("preserves non-empty AI SDK error messages", () => {
+    const result = MessageV2.fromError(new Error("Bad Request"), { providerID })
+    expect(result.name).toBe("UnknownError")
+    expect(result.data).toStrictEqual({ message: "Bad Request" })
+  })
+
+  test("classifies retryable AI SDK failures with retry-after details", () => {
+    const error = MessageV2.fromError(
+      new APICallError({
+        message: "",
+        url: "https://api.example.com/chat",
+        requestBodyValues: { messages: [] },
+        statusCode: 429,
+        responseHeaders: { "retry-after": "7" },
+        isRetryable: false,
+      }),
+      { providerID },
+    ) as SessionV1.APIError
+    expect(SessionV1.APIError.isInstance(error)).toBe(true)
+    expect(error.data.isRetryable).toBe(true)
+    expect(SessionRetry.delay(1, error)).toBe(7000)
+  })
+
+  test("detects context overflow from data-only AI SDK errors", () => {
+    const result = MessageV2.fromError(
+      new APICallError({
+        message: "",
+        url: "https://api.example.com/chat",
+        requestBodyValues: { messages: [] },
+        statusCode: 400,
+        responseHeaders: { "content-type": "application/json" },
+        data: { error: { code: "context_length_exceeded" } },
+      }),
+      { providerID },
+    )
+    expect(SessionV1.ContextOverflowError.isInstance(result)).toBe(true)
+  })
+
+  test("retries status-less AI SDK transport failures", () => {
+    const error = MessageV2.fromError(
+      new APICallError({
+        message: "Cannot connect to API: connection refused",
+        url: "https://api.example.com/chat",
+        requestBodyValues: { messages: [] },
+        isRetryable: true,
+      }),
+      { providerID },
+    )
+    expect(SessionV1.APIError.isInstance(error)).toBe(true)
+    expect(SessionRetry.retryable(error, "test")).toEqual({
+      message: "Cannot connect to API: connection refused",
+    })
   })
 })
 

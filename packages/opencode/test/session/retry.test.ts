@@ -4,7 +4,8 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError } from "ai"
 import { setTimeout as sleep } from "node:timers/promises"
-import { Effect, Schedule, Schema } from "effect"
+import { Effect, Exit, Fiber, Schedule, Schema, Scope } from "effect"
+import * as TestClock from "effect/testing/TestClock"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { SessionRetry } from "../../src/session/retry"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -144,6 +145,75 @@ describe("session.retry.delay", () => {
       )
 
       expect(attempts).toStrictEqual([1, 2, 3, 4, 5])
+    }),
+  )
+})
+
+describe("session.retry.policy cap", () => {
+  it.instance("surfaces the error after maxAttempts instead of retrying forever", () =>
+    Effect.gen(function* () {
+      const sessionID = SessionID.make("session-retry-cap")
+      const status = yield* SessionStatus.Service
+      const error = apiError({ "retry-after-ms": "0" })
+      const attempts: number[] = []
+
+      const result = yield* Effect.fail(error).pipe(
+        Effect.retry(
+          SessionRetry.policy({
+            provider: "test",
+            maxAttempts: 2,
+            parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+            set: (info) => {
+              attempts.push(info.attempt)
+              return status.set(sessionID, {
+                type: "retry",
+                attempt: info.attempt,
+                message: info.message,
+                next: info.next,
+              })
+            },
+          }),
+        ),
+        Effect.exit,
+      )
+
+      expect(Exit.isFailure(result)).toBe(true)
+      expect(attempts).toStrictEqual([1, 2])
+      expect(yield* status.get(sessionID)).toMatchObject({ type: "retry", attempt: 2 })
+    }),
+  )
+
+  it.effect("surfaces the error after maxElapsedMs even when attempts remain", () =>
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      // retry-after of 60s each; a 5s elapsed budget forces the elapsed cap first
+      const error = apiError({ "retry-after": "60" })
+      const attempts: number[] = []
+
+      const fiber = yield* Effect.fail(error).pipe(
+        Effect.retry(
+          SessionRetry.policy({
+            provider: "test",
+            maxAttempts: 8,
+            maxElapsedMs: 5_000,
+            parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+            set: (info) =>
+              Effect.sync(() => {
+                attempts.push(info.attempt)
+              }),
+          }),
+        ),
+        Effect.exit,
+        Effect.forkIn(scope, { startImmediately: true }),
+      )
+
+      // First attempt waits the full 60s retry-after; advance past the elapsed budget
+      yield* TestClock.adjust("61 seconds")
+      const result = yield* Fiber.join(fiber)
+
+      expect(Exit.isFailure(result)).toBe(true)
+      // 60s retry-after per attempt: only the first attempt fits before elapsed runs out
+      expect(attempts).toStrictEqual([1])
     }),
   )
 })

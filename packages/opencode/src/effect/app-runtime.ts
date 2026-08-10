@@ -54,6 +54,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilderV1 } from "./app-node-builder-v1"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { EventRetention } from "@opencode-ai/core/event/retention"
 
 export const AppLayer = AppNodeBuilderV1.build(
   LayerNode.group([
@@ -68,6 +69,7 @@ export const AppLayer = AppNodeBuilderV1.build(
     Snapshot.node,
     Plugin.node,
     ModelsDev.node,
+    EventRetention.node,
     Provider.node,
     ProviderAuth.node,
     Agent.node,

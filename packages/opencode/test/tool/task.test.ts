@@ -34,6 +34,16 @@ const ref = {
   modelID: ModelV2.ID.make("test-model"),
 }
 
+const deepseek = {
+  providerID: ProviderV2.ID.make("opencode-go"),
+  modelID: ModelV2.ID.make("deepseek-v4-flash"),
+}
+
+const luna = {
+  providerID: ProviderV2.ID.make("openai"),
+  modelID: ModelV2.ID.make("gpt-5.6-luna"),
+}
+
 const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
   LayerNode.compile(
     LayerNode.group([
@@ -66,7 +76,7 @@ function defer<T>() {
   return { promise, resolve }
 }
 
-const seed = Effect.fn("TaskToolTest.seed")(function* (title = "Pinned") {
+const seed = Effect.fn("TaskToolTest.seed")(function* (title = "Pinned", model = ref) {
   const session = yield* Session.Service
   const chat = yield* session.create({ title })
   const user = yield* session.updateMessage({
@@ -74,7 +84,7 @@ const seed = Effect.fn("TaskToolTest.seed")(function* (title = "Pinned") {
     role: "user",
     sessionID: chat.id,
     agent: "build",
-    model: ref,
+    model,
     time: { created: Date.now() },
   })
   const assistant: SessionV1.Assistant = {
@@ -87,8 +97,8 @@ const seed = Effect.fn("TaskToolTest.seed")(function* (title = "Pinned") {
     cost: 0,
     path: { cwd: "/tmp", root: "/tmp" },
     tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-    modelID: ref.modelID,
-    providerID: ref.providerID,
+    modelID: model.modelID,
+    providerID: model.providerID,
     variant: "xhigh",
     time: { created: Date.now() },
   }
@@ -417,6 +427,118 @@ describe("tool.task", () => {
         },
       })
     }),
+  )
+
+  it.instance(
+    "execute uses the exact luna agent model instead of the parent model",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const { chat, assistant } = yield* seed("Pinned", deepseek)
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const metadata: unknown[] = []
+        let seen: SessionPrompt.PromptInput | undefined
+
+        const result = yield* def.execute(
+          {
+            description: "inspect luna routing",
+            prompt: "trace the selected model",
+            subagent_type: "luna",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ onPrompt: (input) => (seen = input) }) },
+            messages: [],
+            metadata: (input) =>
+              Effect.sync(() => {
+                metadata.push(input)
+              }),
+            ask: () => Effect.void,
+          },
+        )
+
+        const child = yield* sessions.get(result.metadata.sessionId)
+        expect(child.agent).toBe("luna")
+        expect(result.metadata.model).toEqual(luna)
+        expect(metadata).toEqual([
+          {
+            title: "inspect luna routing",
+            metadata: {
+              parentSessionId: chat.id,
+              sessionId: child.id,
+              model: luna,
+            },
+          },
+        ])
+        expect(seen?.agent).toBe("luna")
+        expect(seen?.model).toEqual(luna)
+        expect(seen?.model).not.toEqual(deepseek)
+      }),
+    {
+      config: {
+        agent: {
+          luna: {
+            mode: "subagent",
+            model: "openai/gpt-5.6-luna",
+          },
+        },
+      },
+    },
+  )
+
+  it.instance(
+    "execute rejects luna when only the gpt56-luna key is registered",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+
+        const exit = yield* def
+          .execute(
+            {
+              description: "inspect luna routing",
+              prompt: "trace the selected model",
+              subagent_type: "luna",
+            },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              agent: "build",
+              abort: new AbortController().signal,
+              extra: { promptOps: stubOps() },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+          .pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) {
+          const failure = Cause.squash(exit.cause)
+          expect(failure).toBeInstanceOf(Error)
+          if (failure instanceof Error) {
+            expect(failure.message).toBe("Unknown agent type: luna is not a valid agent type")
+          }
+        }
+        expect(yield* sessions.children(chat.id)).toHaveLength(0)
+      }),
+    {
+      config: {
+        agent: {
+          "gpt56-luna": {
+            mode: "subagent",
+            model: "openai/gpt-5.6-luna",
+          },
+        },
+      },
+    },
   )
 
   it.instance("execute cancels child session when abort signal fires", () =>

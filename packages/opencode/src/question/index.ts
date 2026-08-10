@@ -32,6 +32,15 @@ export class RejectedError extends Schema.TaggedErrorClass<RejectedError>()("Que
   }
 }
 
+export class InvalidQuestionsError extends Schema.TaggedErrorClass<InvalidQuestionsError>()(
+  "QuestionInvalidQuestionsError",
+  {},
+) {
+  override get message() {
+    return EMPTY_QUESTIONS_ERROR
+  }
+}
+
 export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Question.NotFoundError", {
   requestID: QuestionID,
 }) {}
@@ -52,7 +61,7 @@ export interface Interface {
     sessionID: SessionID
     questions: ReadonlyArray<Info>
     tool?: Tool
-  }) => Effect.Effect<ReadonlyArray<Answer>, RejectedError>
+  }) => Effect.Effect<ReadonlyArray<Answer>, RejectedError | InvalidQuestionsError>
   readonly reply: (input: {
     requestID: QuestionID
     answers: ReadonlyArray<Answer>
@@ -91,9 +100,12 @@ const layer = Layer.effect(
       questions: ReadonlyArray<Info>
       tool?: Tool
     }) {
-      // An empty questions array has nothing to render or answer; registering a
-      // pending request for it would wait forever. Reject it up front instead.
-      if (input.questions.length === 0) return yield* Effect.die(new Error(EMPTY_QUESTIONS_ERROR))
+      // An empty questions array (or a non-array that would otherwise bypass
+      // this check) has nothing to render or answer; registering a pending
+      // request for it would wait forever. Reject it up front instead.
+      if (!Array.isArray(input.questions) || input.questions.length === 0) {
+        return yield* new InvalidQuestionsError()
+      }
       const pending = (yield* InstanceState.get(state)).pending
       const id = QuestionID.ascending()
       yield* Effect.logInfo("asking", { id, questions: input.questions.length })

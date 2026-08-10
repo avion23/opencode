@@ -325,11 +325,11 @@ const layer = Layer.effect(
       fallback: SessionV1.User["model"]
     }) {
       const sessionInfo = yield* session.get(input.sessionID).pipe(Effect.orDie)
-      const selected = input.agent.model
+      const explicit = input.agent.model
+      const selected = explicit
         ? {
-            providerID: input.agent.model.providerID,
-            modelID: input.agent.model.modelID,
-            variant: input.fallback.variant,
+            providerID: explicit.providerID,
+            modelID: explicit.modelID,
           }
         : sessionInfo.model
           ? {
@@ -342,8 +342,15 @@ const layer = Layer.effect(
       return {
         model,
         // Respect the compaction agent's configured variant when the resolved
-        // model actually provides it; otherwise keep the model's own variant.
-        variant: input.agent.variant && model.variants?.[input.agent.variant] ? input.agent.variant : selected.variant,
+        // model actually provides it; otherwise fall back to that model's own
+        // variant. Never carry the source session's variant onto an explicit
+        // compaction model — a same-named variant may mean something else.
+        variant:
+          input.agent.variant && model.variants?.[input.agent.variant]
+            ? input.agent.variant
+            : explicit
+              ? undefined
+              : selected.variant,
       }
     })
 

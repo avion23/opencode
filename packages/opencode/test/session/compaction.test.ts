@@ -1878,6 +1878,65 @@ describe("session.compaction.model selection", () => {
     },
     { git: true },
   )
+
+  itCompaction.instance(
+    "does not leak the source session variant onto an explicit compaction agent model that lacks it",
+    () => {
+      const stub = llm()
+      let streamedVariant: string | undefined
+      stub.push(
+        reply("summary", (input) => {
+          streamedVariant = input.user.model.variant
+        }),
+      )
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const msg = yield* ssn.updateMessage({
+          id: MessageID.ascending(),
+          role: "user",
+          sessionID: session.id,
+          agent: "build",
+          model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model"), variant: "high" },
+          time: { created: Date.now() },
+        })
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(result).toBe("continue")
+        // The explicit compaction agent model only provides the "low" variant,
+        // so "high" from the source session must not leak onto the compaction
+        // request; the request uses no variant at all.
+        expect(streamedVariant).toBeUndefined()
+        const summary = (yield* ssn.messages({ sessionID: session.id })).find(
+          (item) => item.info.role === "assistant" && item.info.summary,
+        )
+        expect(summary?.info.role).toBe("assistant")
+        if (summary?.info.role === "assistant") {
+          expect(summary.info.variant).toBeUndefined()
+        }
+      }).pipe(
+        withCompaction({
+          llm: stub.llmLayer,
+          provider: providerWithModels([
+            createModel({ context: 100_000, output: 32_000, id: "test-model" }),
+            {
+              ...createModel({ context: 100_000, output: 32_000, id: "test-agent-model" }),
+              variants: { low: {} },
+            },
+          ]),
+          config: cfgAgentModel("test/test-agent-model"),
+        }),
+      )
+    },
+    { git: true },
+  )
 })
 
 describe("session.compaction context-fit preflight", () => {

@@ -40,6 +40,15 @@ export class RejectedError extends Schema.TaggedErrorClass<RejectedError>()("Que
   }
 }
 
+export class InvalidQuestionsError extends Schema.TaggedErrorClass<InvalidQuestionsError>()(
+  "QuestionV2InvalidQuestionsError",
+  {},
+) {
+  override get message() {
+    return EMPTY_QUESTIONS_ERROR
+  }
+}
+
 export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("QuestionV2.NotFoundError", {
   requestID: ID,
 }) {}
@@ -56,7 +65,7 @@ export interface ReplyInput {
 }
 
 export interface Interface {
-  readonly ask: (input: AskInput) => Effect.Effect<ReadonlyArray<Answer>, RejectedError>
+  readonly ask: (input: AskInput) => Effect.Effect<ReadonlyArray<Answer>, RejectedError | InvalidQuestionsError>
   readonly reply: (input: ReplyInput) => Effect.Effect<void, NotFoundError>
   readonly reject: (requestID: ID) => Effect.Effect<void, NotFoundError>
   readonly list: () => Effect.Effect<ReadonlyArray<Request>>
@@ -92,28 +101,30 @@ const layer = Layer.effect(
       ),
     )
 
-    const ask = Effect.fn("QuestionV2.ask")((input: AskInput) =>
-      // An empty questions array has nothing to render or answer; registering a
-      // pending request for it would wait forever. Reject it up front instead.
-      input.questions.length === 0
-        ? Effect.die(new Error(EMPTY_QUESTIONS_ERROR))
-        : Effect.uninterruptibleMask((restore) =>
-            Effect.gen(function* () {
-              const id = ID.ascending()
-              const deferred = yield* Deferred.make<ReadonlyArray<Answer>, RejectedError>()
-              const request: Request = { id, ...input }
-              pending.set(id, { request, deferred })
-              return yield* events.publish(Event.Asked, request).pipe(
-                Effect.andThen(restore(Deferred.await(deferred))),
-                Effect.ensuring(
-                  Effect.sync(() => {
-                    pending.delete(id)
-                  }),
-                ),
-              )
-            }),
-          ),
-    )
+    const ask = Effect.fn("QuestionV2.ask")(function* (input: AskInput) {
+      // An empty questions array (or a non-array that would otherwise bypass
+      // this check) has nothing to render or answer; registering a pending
+      // request for it would wait forever. Reject it up front instead.
+      if (!Array.isArray(input.questions) || input.questions.length === 0) {
+        return yield* new InvalidQuestionsError()
+      }
+      return yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const id = ID.ascending()
+          const deferred = yield* Deferred.make<ReadonlyArray<Answer>, RejectedError>()
+          const request: Request = { id, ...input }
+          pending.set(id, { request, deferred })
+          return yield* events.publish(Event.Asked, request).pipe(
+            Effect.andThen(restore(Deferred.await(deferred))),
+            Effect.ensuring(
+              Effect.sync(() => {
+                pending.delete(id)
+              }),
+            ),
+          )
+        }),
+      )
+    })
 
     const reply = Effect.fn("QuestionV2.reply")((input: ReplyInput) =>
       Effect.uninterruptible(
