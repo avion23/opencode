@@ -226,6 +226,34 @@ const fragmentFailureLLM = Layer.succeed(
 const fragmentFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, fragmentFailureLLM]])
 const itFragmentFailure = testEffect(fragmentFailureEnv)
 
+const orphanDelta = { calls: 0 }
+const orphanDeltaLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () => {
+      orphanDelta.calls += 1
+      if (orphanDelta.calls === 1) {
+        return Stream.make(
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.textDelta({ id: "text-0", text: "orphan content" }),
+          LLMEvent.stepFinish({ index: 0, reason: "unknown" }),
+          LLMEvent.finish({ reason: "unknown" }),
+        )
+      }
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "text-0" }),
+        LLMEvent.textDelta({ id: "text-0", text: "after" }),
+        LLMEvent.textEnd({ id: "text-0" }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      )
+    },
+  }),
+)
+const orphanDeltaEnv = LayerNode.compile(root, [...replacements, [LLM.node, orphanDeltaLLM]])
+const itOrphanDelta = testEffect(orphanDeltaEnv)
+
 const boot = Effect.fn("test.boot")(function* () {
   const processors = yield* SessionProcessor.Service
   const session = yield* Session.Service
@@ -602,6 +630,116 @@ it.live("session.processor effect tests retry recognized structured json errors"
       }),
     { config: (url) => providerCfg(url) },
   ),
+)
+
+it.live("session.processor effect tests retry empty responses with unknown finish reasons", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+
+        yield* llm.push(
+          raw({
+            chunks: [
+              {
+                id: "chatcmpl-test",
+                object: "chat.completion.chunk",
+                choices: [{ delta: { role: "assistant" }, finish_reason: null }],
+              },
+              {
+                id: "chatcmpl-test",
+                object: "chat.completion.chunk",
+                choices: [{ delta: {}, finish_reason: "unknown_reason" }],
+              },
+            ],
+          }),
+          reply().text("after").stop(),
+        )
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "retry empty")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "retry empty" }],
+          tools: {},
+        })
+
+        const parts = yield* MessageV2.parts(msg.id)
+
+        expect(value).toBe("continue")
+        expect(yield* llm.calls).toBe(2)
+        expect(parts.some((part) => part.type === "text" && part.text === "after")).toBe(true)
+        expect(handle.message.error).toBeUndefined()
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+itOrphanDelta.live(
+  "session.processor effect tests retry unknown finishes when orphan text deltas are discarded",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          orphanDelta.calls = 0
+          const { processors, session, provider } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "retry orphan")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "retry orphan" }],
+            tools: {},
+          })
+
+          const parts = yield* MessageV2.parts(msg.id)
+
+          expect(value).toBe("continue")
+          expect(orphanDelta.calls).toBe(2)
+          expect(parts.some((part) => part.type === "text" && part.text === "after")).toBe(true)
+          expect(parts.some((part) => part.type === "text" && part.text.includes("orphan content"))).toBe(false)
+          expect(handle.message.error).toBeUndefined()
+        }),
+      { config: cfg },
+    ),
 )
 
 it.live("session.processor effect tests retry OpenAI-compatible midstream server errors", () =>
