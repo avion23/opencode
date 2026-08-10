@@ -14,6 +14,7 @@ import { Effect, Exit, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
+import { Truncate } from "@/tool/truncate"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
@@ -39,6 +40,20 @@ const BACKGROUND_UPDATED = [
   "DO NOT sleep, poll for progress, ask the task for status, or duplicate this task's work — avoid working with the same files or topics it is using.",
   "Work on non-overlapping tasks, or briefly tell the user what you sent and end your response.",
 ].join("\n")
+
+// Cap inlined subagent output so accumulating task results cannot grow the
+// parent context unbounded. The Truncate service writes the full text to disk
+// and returns a bounded preview plus a hint when this budget is exceeded.
+const MAX_TASK_RESULT_BYTES = 16 * 1024
+
+function emptyResultMessage(finish: string | undefined, outputTokens: number) {
+  return `subagent returned no final text (finish=${finish ?? "unknown"}, output_tokens=${outputTokens})`
+}
+
+const EMPTY_RESULT_HINT = [
+  "The child produced no deliverable output.",
+  "Consider re-dispatching with a lower reasoning budget or smaller scope.",
+].join(" ")
 
 const BaseParameterFields = {
   description: Schema.String.annotate({ description: "A short (3-5 words) description of the task" }),
@@ -68,11 +83,12 @@ function renderOutput(input: {
   text: string
 }) {
   const tag = input.state === "error" ? "task_error" : "task_result"
+  const empty = input.state === "completed" && input.text.trim() === ""
   return [
     `<task id="${input.sessionID}" state="${input.state}">`,
     ...(input.summary ? [`<summary>${input.summary}</summary>`] : []),
-    `<${tag}>`,
-    input.text,
+    empty ? `<task_result state="empty">` : `<${tag}>`,
+    empty ? emptyResultMessage(undefined, 0) : input.text,
     `</${tag}>`,
     "</task>",
   ].join("\n")
@@ -88,6 +104,7 @@ export const TaskTool = Tool.define(
     const scope = yield* Scope.Scope
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const truncate = yield* Truncate.Service
 
     const run = Effect.fn("TaskTool.execute")(function* (
       params: Schema.Schema.Type<typeof Parameters>,
@@ -197,6 +214,7 @@ export const TaskTool = Tool.define(
       const ops = ctx.extra?.promptOps as TaskPromptOps
       if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
 
+      let childState: "completed" | "error" = "completed"
       const runTask = Effect.fn("TaskTool.runTask")(function* () {
         const parts = yield* ops.resolvePromptParts(params.prompt)
         const result = yield* ops.prompt({
@@ -221,7 +239,20 @@ export const TaskTool = Tool.define(
         if (failed?.type === "tool" && failed.state.status === "error") {
           return yield* Effect.fail(new Error(`Subagent failed (task_id: ${nextSession.id}): ${failed.state.error}`))
         }
-        return result.parts.findLast((item) => item.type === "text")?.text ?? ""
+        const text = result.parts.findLast((item) => item.type === "text")?.text ?? ""
+        if (text.trim() === "") {
+          const finish = result.info.role === "assistant" ? result.info.finish : undefined
+          const outputTokens = result.info.role === "assistant" ? result.info.tokens.output : 0
+          const diagnostic = emptyResultMessage(finish, outputTokens)
+          const failed =
+            finish === "length" || finish === "unknown" || finish === "error" || outputTokens === 0
+          childState = failed ? "error" : "completed"
+          return failed ? `${diagnostic}. ${EMPTY_RESULT_HINT}` : diagnostic
+        }
+        childState = "completed"
+        const parentAgent = yield* agent.get(ctx.agent)
+        const truncated = yield* truncate.output(text, { maxBytes: MAX_TASK_RESULT_BYTES }, parentAgent)
+        return truncated.content
       })
 
       const inject = Effect.fn("TaskTool.injectBackgroundResult")(function* (
@@ -256,7 +287,7 @@ export const TaskTool = Tool.define(
       const notify = Effect.fn("TaskTool.notifyBackgroundResult")(function* (jobID: string) {
         yield* background.wait({ id: jobID }).pipe(
           Effect.flatMap((result) => {
-            if (result.info?.status === "completed") return inject("completed", result.info.output ?? "")
+            if (result.info?.status === "completed") return inject(childState, result.info.output ?? "")
             if (result.info?.status === "error") return inject("error", result.info.error ?? "")
             return Effect.void
           }),
@@ -341,7 +372,7 @@ export const TaskTool = Tool.define(
             return {
               title: params.description,
               metadata,
-              output: renderOutput({ sessionID: nextSession.id, state: "completed", text: result?.output ?? "" }),
+              output: renderOutput({ sessionID: nextSession.id, state: childState, text: result?.output ?? "" }),
             }
           }),
         (_, exit) =>

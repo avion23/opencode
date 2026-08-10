@@ -316,6 +316,33 @@ const layer = Layer.effect(
       }
     })
 
+    // Compaction model precedence: explicit `compaction` agent model, then the
+    // session's primary model, then the model stamped on the compaction user
+    // message (which reflects the last user-selected model).
+    const resolveModel = Effect.fn("SessionCompaction.resolveModel")(function* (input: {
+      agent: Agent.Info
+      sessionID: SessionID
+      fallback: SessionV1.User["model"]
+    }) {
+      if (input.agent.model)
+        return {
+          model: yield* provider.getModel(input.agent.model.providerID, input.agent.model.modelID).pipe(Effect.orDie),
+          variant: input.agent.variant,
+        }
+      const sessionInfo = yield* session.get(input.sessionID).pipe(Effect.orDie)
+      const selected = sessionInfo.model
+        ? {
+            providerID: sessionInfo.model.providerID,
+            modelID: sessionInfo.model.id,
+            variant: sessionInfo.model.variant,
+          }
+        : input.fallback
+      return {
+        model: yield* provider.getModel(selected.providerID, selected.modelID).pipe(Effect.orDie),
+        variant: selected.variant,
+      }
+    })
+
     const processCompaction = Effect.fn("SessionCompaction.process")(function* (input: {
       parentID: MessageID
       messages: SessionV1.WithParts[]
@@ -356,9 +383,11 @@ const layer = Layer.effect(
       }
 
       const agent = yield* agents.get("compaction")
-      const model = agent.model
-        ? yield* provider.getModel(agent.model.providerID, agent.model.modelID).pipe(Effect.orDie)
-        : yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)
+      const { model, variant } = yield* resolveModel({
+        agent,
+        sessionID: input.sessionID,
+        fallback: userMessage.model,
+      })
       const cfg = yield* config.get()
       const history = compactionPart && messages.at(-1)?.info.id === input.parentID ? messages.slice(0, -1) : messages
       const prior = completedCompactions(history)
@@ -397,7 +426,7 @@ const layer = Layer.effect(
         sessionID: input.sessionID,
         mode: "compaction",
         agent: "compaction",
-        variant: userMessage.model.variant,
+        variant,
         summary: true,
         path: {
           cwd: ctx.directory,
@@ -417,13 +446,37 @@ const layer = Layer.effect(
         },
       }
       yield* session.updateMessage(msg)
+      const prompt = [nextPrompt, "The following is the conversation history:", conversation]
+        .filter(Boolean)
+        .join("\n\n")
+      // The actual request prepends the compaction agent's system prompt (see
+      // LLMRequestPrep.prepare), so it must count against the model window too.
+      const systemPrompt = [agent.prompt, userMessage.system].filter(Boolean).join("\n")
+      const capacity = usable({ cfg, model, outputTokenMax: flags.outputTokenMax })
+      const estimate = Token.estimate(prompt) + (systemPrompt ? Token.estimate(systemPrompt) : 0)
+      // Fail fast when the model has a known context limit but no usable
+      // capacity (reserved >= input window, or the output reservation consumes
+      // all of it) — the oversized request would otherwise stream and fail at
+      // the provider. Unknown context (limit.context === 0) still streams.
+      if ((capacity > 0 && estimate > capacity) || (capacity === 0 && model.limit.context !== 0)) {
+        msg.error = new SessionV1.ContextOverflowError({
+          message: replay
+            ? "Conversation history too large to compact - exceeds model context limit"
+            : "Session too large to compact - context exceeds model limit even after stripping media",
+        }).toObject()
+        msg.finish = "error"
+        yield* session.updateMessage(msg)
+        return "stop"
+      }
       const processor = yield* processors.create({
         assistantMessage: msg,
         sessionID: input.sessionID,
         model,
       })
       const result = yield* processor.process({
-        user: userMessage,
+        // ResolveModel selected the model + variant for this compaction; the
+        // stream must apply the same variant the summary message claims.
+        user: { ...userMessage, model: { ...userMessage.model, variant } },
         agent,
         sessionID: input.sessionID,
         tools: {},
@@ -434,12 +487,7 @@ const layer = Layer.effect(
             content: [
               {
                 type: "text",
-                text: [
-                  nextPrompt,
-                  ...(compacting.prompt ? ["The following is the conversation history:", conversation] : []),
-                ]
-                  .filter(Boolean)
-                  .join("\n\n"),
+text: compacting.prompt ? prompt : nextPrompt,
               },
             ],
           },

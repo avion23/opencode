@@ -101,6 +101,7 @@ function stubOps(opts?: {
   text?: string
   error?: NonNullable<SessionV1.Assistant["error"]>
   toolError?: string
+  finish?: string
 }): TaskPromptOps {
   return {
     cancel: () => Effect.void,
@@ -108,7 +109,7 @@ function stubOps(opts?: {
     prompt: (input) =>
       Effect.sync(() => {
         opts?.onPrompt?.(input)
-        return reply(input, opts?.text ?? "done", opts?.error, opts?.toolError)
+        return reply(input, opts?.text ?? "done", opts?.error, opts?.toolError, opts?.finish)
       }),
   }
 }
@@ -118,6 +119,7 @@ function reply(
   text: string,
   error?: NonNullable<SessionV1.Assistant["error"]>,
   toolError?: string,
+  finish = "stop",
 ): SessionV1.WithParts {
   const id = MessageID.ascending()
   return {
@@ -134,7 +136,7 @@ function reply(
       modelID: input.model?.modelID ?? ref.modelID,
       providerID: input.model?.providerID ?? ref.providerID,
       time: { created: Date.now() },
-      finish: "stop",
+      finish,
       error,
     },
     parts: [
@@ -501,6 +503,139 @@ describe("tool.task", () => {
       expect(result.metadata.sessionId).not.toBe("ses_missing")
       expect(result.output).toContain(`<task id="${result.metadata.sessionId}" state="completed">`)
       expect(seen?.sessionID).toBe(result.metadata.sessionId)
+    }),
+  )
+
+  it.instance("inlines a bounded preview when the child result is huge", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const huge = Array.from({ length: 5000 }, (_, i) => `line ${i} ${"y".repeat(30)}`).join("\n")
+      const promptOps = stubOps({ text: huge })
+
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(result.output).toContain(`<task id="${result.metadata.sessionId}" state="completed">`)
+      expect(result.output).toContain("<task_result>")
+      expect(result.output).toContain("truncated")
+      expect(result.output.length).toBeLessThan(huge.length)
+      // The generic tool wrapper caps output at 50KB; the task tool itself must
+      // inline a much tighter preview so accumulating subagent results stay small.
+      expect(result.output.length).toBeLessThan(32 * 1024)
+    }),
+  )
+
+  it.instance("renders an error when the child is truncated with no final text", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const promptOps = stubOps({ text: "", finish: "length" })
+
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(result.output).toContain(`<task id="${result.metadata.sessionId}" state="error">`)
+      expect(result.output).toContain("subagent returned no final text")
+      expect(result.output).toContain("finish=length")
+      expect(result.output).toContain("output_tokens=0")
+      expect(result.output).toContain("re-dispatching")
+      expect(result.output).not.toContain('state="completed"')
+      expect(result.output.trim()).not.toBe("")
+    }),
+  )
+
+  it.instance("still completes when the child stops with text", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const promptOps = stubOps({ text: "delivered", finish: "stop" })
+
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(result.output).toContain(`<task id="${result.metadata.sessionId}" state="completed">`)
+      expect(result.output).toContain("delivered")
+      expect(result.output).not.toContain("subagent returned no final text")
+    }),
+  )
+
+  it.instance("inlines normal child results unchanged", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const promptOps = stubOps({ text: "the answer is 42" })
+
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(result.output).toBe(
+        `<task id="${result.metadata.sessionId}" state="completed">\n<task_result>\nthe answer is 42\n</task_result>\n</task>`,
+      )
     }),
   )
 

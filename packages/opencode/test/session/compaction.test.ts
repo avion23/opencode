@@ -60,12 +60,14 @@ function createModel(opts: {
   context: number
   output: number
   input?: number
+  id?: string
+  providerID?: string
   cost?: Provider.Model["cost"]
   npm?: string
 }): Provider.Model {
   return {
-    id: "test-model",
-    providerID: "test",
+    id: opts.id ?? "test-model",
+    providerID: opts.providerID ?? "test",
     name: "Test",
     limit: {
       context: opts.context,
@@ -87,6 +89,23 @@ function createModel(opts: {
 }
 
 const wide = () => ProviderTest.fake({ model: createModel({ context: 100_000, output: 32_000 }) })
+
+function providerWithModels(models: Provider.Model[]) {
+  const first = models[0]!
+  const info = ProviderTest.info(
+    { models: Object.fromEntries(models.map((m) => [m.id, m])) },
+    first,
+  )
+  return ProviderTest.fake({
+    model: first,
+    info,
+    getModel: Effect.fn("TestProvider.getModel")((providerID, modelID) => {
+      const found = models.find((m) => m.providerID === providerID && m.id === modelID)
+      if (found) return Effect.succeed(found)
+      return Effect.die(new Error(`Unknown test model: ${providerID}/${modelID}`))
+    }),
+  })
+}
 
 function createUserMessage(sessionID: SessionID, text: string) {
   return Effect.gen(function* () {
@@ -220,6 +239,20 @@ function processorLayer(result: "continue" | "compact") {
 function cfg(compaction?: ConfigV1.Info["compaction"]) {
   const base = Schema.decodeUnknownSync(ConfigV1.Info)({}) as ConfigV1.Info
   return Layer.succeed(Config.Service, TestConfig.make({ get: () => Effect.succeed({ ...base, compaction }) }))
+}
+
+function cfgAgentModel(model: string) {
+  const base = Schema.decodeUnknownSync(ConfigV1.Info)({}) as ConfigV1.Info
+  return Layer.succeed(
+    Config.Service,
+    TestConfig.make({
+      get: () =>
+        Effect.succeed({
+          ...base,
+          agent: { ...(base.agent ?? {}), compaction: { model } },
+        } satisfies ConfigV1.Info),
+    }),
+  )
 }
 
 const defaultProvider = wide()
@@ -1659,6 +1692,346 @@ describe("session.compaction.process", () => {
       expect(part?.type).toBe("compaction")
       expect(part?.tail_start_id).toBe(keep.id)
     }).pipe(withCompaction({ config: cfg({ tail_turns: 2, preserve_recent_tokens: 500 }) })),
+  )
+})
+
+describe("session.compaction.model selection", () => {
+  itCompaction.instance(
+    "prefers the session's primary model over the compaction user message's model",
+    () => {
+      const stub = llm()
+      let streamedModel: string | undefined
+      stub.push(
+        reply("summary", (input) => {
+          streamedModel = input.model.id
+        }),
+      )
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({
+          model: { id: ModelV2.ID.make("test-big"), providerID: ProviderV2.ID.make("test") },
+        })
+        const msg = yield* createUserMessage(session.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(result).toBe("continue")
+        expect(streamedModel).toBe("test-big")
+        const summary = (yield* ssn.messages({ sessionID: session.id })).find(
+          (item) => item.info.role === "assistant" && item.info.summary,
+        )
+        expect(summary?.info.role).toBe("assistant")
+        if (summary?.info.role === "assistant") {
+          expect(summary.info.modelID).toBe(ModelV2.ID.make("test-big"))
+        }
+      }).pipe(
+        withCompaction({
+          llm: stub.llmLayer,
+          provider: providerWithModels([
+            createModel({ context: 100_000, output: 32_000, id: "test-model" }),
+            createModel({ context: 100_000, output: 32_000, id: "test-big" }),
+          ]),
+        }),
+      )
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "lets an explicitly configured compaction agent model win over the session model",
+    () => {
+      const stub = llm()
+      let streamedModel: string | undefined
+      stub.push(
+        reply("summary", (input) => {
+          streamedModel = input.model.id
+        }),
+      )
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({
+          model: { id: ModelV2.ID.make("test-big"), providerID: ProviderV2.ID.make("test") },
+        })
+        const msg = yield* createUserMessage(session.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(result).toBe("continue")
+        expect(streamedModel).toBe("test-agent-model")
+      }      ).pipe(
+        withCompaction({
+          llm: stub.llmLayer,
+          provider: providerWithModels([
+            createModel({ context: 100_000, output: 32_000, id: "test-model" }),
+            createModel({ context: 100_000, output: 32_000, id: "test-big" }),
+            createModel({ context: 100_000, output: 32_000, id: "test-agent-model" }),
+          ]),
+          config: cfgAgentModel("test/test-agent-model"),
+        }),
+      )
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "propagates the resolved variant to the provider request",
+    () => {
+      const stub = llm()
+      let streamedVariant: string | undefined
+      stub.push(
+        reply("summary", (input) => {
+          streamedVariant = input.user.model.variant
+        }),
+      )
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({
+          model: {
+            id: ModelV2.ID.make("test-big"),
+            providerID: ProviderV2.ID.make("test"),
+            variant: "think-high",
+          },
+        })
+        const msg = yield* createUserMessage(session.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(result).toBe("continue")
+        expect(streamedVariant).toBe("think-high")
+        const summary = (yield* ssn.messages({ sessionID: session.id })).find(
+          (item) => item.info.role === "assistant" && item.info.summary,
+        )
+        expect(summary?.info.role).toBe("assistant")
+        if (summary?.info.role === "assistant") {
+          expect(summary.info.variant).toBe("think-high")
+        }
+      }).pipe(
+        withCompaction({
+          llm: stub.llmLayer,
+          provider: providerWithModels([
+            createModel({ context: 100_000, output: 32_000, id: "test-model" }),
+            createModel({ context: 100_000, output: 32_000, id: "test-big" }),
+          ]),
+        }),
+      )
+    },
+    { git: true },
+  )
+})
+
+describe("session.compaction context-fit preflight", () => {
+  itCompaction.instance(
+    "fails fast without calling the provider when the serialized head exceeds the model window",
+    () => {
+      const stub = llm()
+      let streamed = false
+      stub.push(() => {
+        streamed = true
+        return Stream.empty
+      })
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const msg = yield* createUserMessage(session.id, "x".repeat(50_000))
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(result).toBe("stop")
+        expect(streamed).toBe(false)
+        const summary = (yield* ssn.messages({ sessionID: session.id })).find(
+          (item) => item.info.role === "assistant" && item.info.summary,
+        )
+        expect(summary?.info.role).toBe("assistant")
+        if (summary?.info.role === "assistant") {
+          expect(summary.info.finish).toBe("error")
+          expect(JSON.stringify(summary.info.error)).toContain("Session too large to compact")
+        }
+      }).pipe(
+        withCompaction({
+          llm: stub.llmLayer,
+          provider: ProviderTest.fake({ model: createModel({ context: 2_000, output: 100 }) }),
+        }),
+      )
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "streams when the serialized head fits the model window",
+    () => {
+      const stub = llm()
+      let streamedModel: string | undefined
+      stub.push(
+        reply("summary", (input) => {
+          streamedModel = input.model.id
+        }),
+      )
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const msg = yield* createUserMessage(session.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(result).toBe("continue")
+        expect(streamedModel).toBe("test-model")
+      }).pipe(
+        withCompaction({
+          llm: stub.llmLayer,
+          provider: ProviderTest.fake({ model: createModel({ context: 2_000, output: 100 }) }),
+        }),
+      )
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "counts the compaction system prompt against the model window",
+    () => {
+      const stub = llm()
+      let streamed = false
+      stub.push(() => {
+        streamed = true
+        return Stream.empty
+      })
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const msg = yield* createUserMessage(session.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(result).toBe("stop")
+        expect(streamed).toBe(false)
+        const summary = (yield* ssn.messages({ sessionID: session.id })).find(
+          (item) => item.info.role === "assistant" && item.info.summary,
+        )
+        expect(summary?.info.role).toBe("assistant")
+        if (summary?.info.role === "assistant") {
+          expect(summary.info.finish).toBe("error")
+          expect(JSON.stringify(summary.info.error)).toContain("Session too large to compact")
+        }
+      }).pipe(
+        withCompaction({
+          llm: stub.llmLayer,
+          provider: ProviderTest.fake({ model: createModel({ context: 500, output: 100 }) }),
+        }),
+      )
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "fails fast when output reservation consumes the whole context",
+    () => {
+      const stub = llm()
+      let streamed = false
+      stub.push(() => {
+        streamed = true
+        return Stream.empty
+      })
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const msg = yield* createUserMessage(session.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(result).toBe("stop")
+        expect(streamed).toBe(false)
+        const summary = (yield* ssn.messages({ sessionID: session.id })).find(
+          (item) => item.info.role === "assistant" && item.info.summary,
+        )
+        expect(summary?.info.role).toBe("assistant")
+        if (summary?.info.role === "assistant") {
+          expect(summary.info.finish).toBe("error")
+          expect(JSON.stringify(summary.info.error)).toContain("Session too large to compact")
+        }
+      }).pipe(
+        withCompaction({
+          llm: stub.llmLayer,
+          provider: ProviderTest.fake({ model: createModel({ context: 2_000, output: 2_000 }) }),
+        }),
+      )
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "streams when the model context limit is unknown",
+    () => {
+      const stub = llm()
+      let streamedModel: string | undefined
+      stub.push(
+        reply("summary", (input) => {
+          streamedModel = input.model.id
+        }),
+      )
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const msg = yield* createUserMessage(session.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(result).toBe("continue")
+        expect(streamedModel).toBe("test-model")
+      }).pipe(
+        withCompaction({
+          llm: stub.llmLayer,
+          provider: ProviderTest.fake({ model: createModel({ context: 0, output: 32_000 }) }),
+        }),
+      )
+    },
+    { git: true },
   )
 })
 

@@ -586,6 +586,132 @@ describe("session.retry.retryable", () => {
 
     expect(SessionRetry.retryable(error, "nararouter")).toBeUndefined()
   })
+
+  test("retries transient 429 when daily quota is still remaining", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Rate limit exceeded. Daily quota remaining: 500 tokens.",
+        isRetryable: true,
+        statusCode: 429,
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toEqual({
+      message: "Rate limit exceeded. Daily quota remaining: 500 tokens.",
+    })
+  })
+
+  test("does not retry hard daily quota that resets on a fixed schedule", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Daily token quota reached. It will reset daily at 00:00 UTC",
+        isRetryable: true,
+        statusCode: 429,
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toBeUndefined()
+  })
+
+  test("does not retry daily limit exceeded until tomorrow", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Your daily limit has been exceeded, try again tomorrow",
+        isRetryable: true,
+        statusCode: 429,
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toBeUndefined()
+  })
+
+  test("does not retry when daily quota is exhausted and none remains until tomorrow", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Daily quota exceeded. No remaining quota until tomorrow.",
+        isRetryable: true,
+        statusCode: 429,
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toBeUndefined()
+  })
+
+  test("does not retry when the exhausted daily quota resets in 24 hours", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Reset in 24 hours. Daily token quota reached.",
+        isRetryable: true,
+        statusCode: 429,
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toBeUndefined()
+  })
+
+  test("does not retry when remaining quota is zero after exhaustion", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Daily quota reached. Remaining quota: 0 tokens.",
+        isRetryable: true,
+        statusCode: 429,
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toBeUndefined()
+  })
+
+  test("does not retry when the exhausted daily quota will reset in 24 hours", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Daily token quota reached. It will reset in 24 hours",
+        isRetryable: true,
+        statusCode: 429,
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toBeUndefined()
+  })
+
+  test("retries when the quota resets and tokens remain", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Your quota resets in 2 hours, remaining 100 tokens",
+        isRetryable: true,
+        statusCode: 429,
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toEqual({
+      message: "Your quota resets in 2 hours, remaining 100 tokens",
+    })
+  })
+
+  test("retries Too Many Requests", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Too Many Requests",
+        isRetryable: true,
+        statusCode: 429,
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toEqual({ message: "Too Many Requests" })
+  })
+
+  test("retries when only the daily quota remaining message is present", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Daily quota remaining: 10 tokens",
+        isRetryable: true,
+        statusCode: 429,
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toEqual({
+      message: "Daily quota remaining: 10 tokens",
+    })
+  })
 })
 
 describe("session.message-v2.fromError", () => {

@@ -40,6 +40,55 @@ const RETRYABLE_MESSAGE_PATTERNS = [
   /\btry again (?:later|in\b)|\b(?:currently|temporarily) at capacity\b/i,
 ]
 
+const NEGATED_EXHAUSTION_RE =
+  /\b(not|no|hasn't|haven't|didn't|won't|cannot|can't)\b[\s\S]{0,15}\b(reached|exceeded|hit|exhausted|depleted)\b/i
+const QUOTA_TERM_RE = /\b(quota|limit|cap)\b/gi
+const EXHAUSTION_RE = /\b(reached|exceeded|hit|exhausted|depleted)\b/gi
+const EXHAUSTION_WORD_RE = /\b(reached|exceeded|hit|exhausted|depleted)\b/i
+const AVAILABILITY_RE = /\b(remaining|reset in)\b/gi
+
+// Availability negation for the daily-quota hard-exhaustion check. A field
+// states quota is still available when an availability phrase ("remaining" /
+// "reset in") pairs with a quota/limit/cap term with no exhaustion verb
+// between them and no exhaustion verb is attached to that same term. This
+// keeps "Rate limit exceeded. Daily quota remaining: 500 tokens." retryable
+// (the exhausted term is "limit", not "quota") while treating "Daily quota
+// exceeded. No remaining quota until tomorrow." as hard exhaustion (the
+// "remaining quota" restates the exhausted daily quota).
+const QUOTA_TERM_WINDOW = 25
+const EXHAUSTION_ASSOC_WINDOW = 40
+
+function availabilityNegation(field: string) {
+  if (NEGATED_EXHAUSTION_RE.test(field)) return true
+  const lower = field.toLowerCase()
+  const terms = [...lower.matchAll(QUOTA_TERM_RE)].map((match) => ({ index: match.index!, word: match[0] }))
+  if (!terms.length) return false
+  const exhausted = new Set<string>()
+  for (const verb of lower.matchAll(EXHAUSTION_RE)) {
+    const verbIndex = verb.index!
+    let nearest: (typeof terms)[number] | undefined
+    let distance = Infinity
+    for (const term of terms) {
+      const d = Math.abs(term.index - verbIndex)
+      if (d < distance) {
+        distance = d
+        nearest = term
+      }
+    }
+    if (nearest && distance <= EXHAUSTION_ASSOC_WINDOW) exhausted.add(nearest.word)
+  }
+  for (const phrase of lower.matchAll(AVAILABILITY_RE)) {
+    const phraseIndex = phrase.index!
+    for (const term of terms) {
+      if (Math.abs(term.index - phraseIndex) > QUOTA_TERM_WINDOW) continue
+      const between = lower.slice(Math.min(phraseIndex, term.index), Math.max(phraseIndex, term.index))
+      if (EXHAUSTION_WORD_RE.test(between)) continue
+      if (!exhausted.has(term.word)) return true
+    }
+  }
+  return false
+}
+
 function cap(ms: number) {
   return Math.min(ms, RETRY_MAX_DELAY)
 }
@@ -145,14 +194,16 @@ export function retryable(error: Err, provider: string) {
     // Hard daily quota caps (e.g. NaraRouter "Daily token quota reached...
     // resets daily at 00:00 UTC") clear on a fixed schedule, not transiently.
     // Retrying hangs until the reset boundary — surface immediately.
-    // Matches explicit exhaustion language only. Negation (not/no/hasn't) before
-    // the verb prevents a match. Each field is tested independently to avoid
-    // cross-field false positives (e.g. "quota remaining" + "limit exceeded").
+    // Matches explicit exhaustion language only. Negation (not/no/hasn't before
+    // the verb) or wording that quota is still available (availabilityNegation)
+    // prevents a match. A fixed-schedule reset after exhaustion ("It will reset
+    // daily at 00:00 UTC") is not negation. Each field is tested independently
+    // to avoid cross-field false positives (e.g. "quota remaining" + "limit
+    // exceeded").
     const DAILY_QUOTA_RE =
       /\bdaily\b[\s\S]{0,30}\b(quota|limit|cap)\b[\s\S]{0,30}\b(reached|exceeded|hit|exhausted|depleted)\b|\b(reached|exceeded|hit|exhausted|depleted)\b[\s\S]{0,10}\bdaily\b[\s\S]{0,30}\b(quota|limit|cap)\b|\b(quota|limit|cap)\b[\s\S]{0,20}\b(reached|exceeded|hit|exhausted|depleted)\b[\s\S]{0,20}\bfor today\b/i
-    const NEGATED_RE = /\b(not|no|hasn't|haven't|didn't|won't|cannot|can't)\b[\s\S]{0,15}\b(reached|exceeded|hit|exhausted|depleted)\b/i
     const fields = [error.data.responseBody, error.data.message].filter((x): x is string => Boolean(x))
-    if (fields.some((f) => DAILY_QUOTA_RE.test(f) && !NEGATED_RE.test(f))) return undefined
+    if (fields.some((f) => DAILY_QUOTA_RE.test(f) && !availabilityNegation(f))) return undefined
     return { message: error.data.message.includes("Overloaded") ? "Provider is overloaded" : error.data.message }
   }
 
