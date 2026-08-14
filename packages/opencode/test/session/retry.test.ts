@@ -671,6 +671,20 @@ describe("session.retry.retryable", () => {
     })
   })
 
+  test("retries when a different quota is exhausted and daily quota remains", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Per-minute quota exceeded. Daily quota remaining: 500 tokens.",
+        isRetryable: true,
+        statusCode: 429,
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "nararouter")).toEqual({
+      message: "Per-minute quota exceeded. Daily quota remaining: 500 tokens.",
+    })
+  })
+
   test("does not retry hard daily quota that resets on a fixed schedule", () => {
     const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
       new SessionV1.APIError({

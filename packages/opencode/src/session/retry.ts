@@ -57,6 +57,7 @@ const QUOTA_TERM_RE = /\b(quota|limit|cap)\b/gi
 const EXHAUSTION_RE = /\b(reached|exceeded|hit|exhausted|depleted)\b/gi
 const EXHAUSTION_WORD_RE = /\b(reached|exceeded|hit|exhausted|depleted)\b/i
 const AVAILABILITY_RE = /\b(remaining|reset in)\b/gi
+const UNAVAILABLE_RE = /\bno\s+remaining\b|\bremaining(?:\s+(?:quota|limit|cap))?\s*:\s*0\b/i
 
 // Availability negation for the daily-quota hard-exhaustion check. A field
 // states quota is still available when an availability phrase ("remaining" /
@@ -74,7 +75,7 @@ function availabilityNegation(field: string) {
   const lower = field.toLowerCase()
   const terms = [...lower.matchAll(QUOTA_TERM_RE)].map((match) => ({ index: match.index!, word: match[0] }))
   if (!terms.length) return false
-  const exhausted = new Set<string>()
+  const exhausted = new Set<number>()
   for (const verb of lower.matchAll(EXHAUSTION_RE)) {
     const verbIndex = verb.index!
     let nearest: (typeof terms)[number] | undefined
@@ -86,15 +87,16 @@ function availabilityNegation(field: string) {
         nearest = term
       }
     }
-    if (nearest && distance <= EXHAUSTION_ASSOC_WINDOW) exhausted.add(nearest.word)
+    if (nearest && distance <= EXHAUSTION_ASSOC_WINDOW) exhausted.add(nearest.index)
   }
   for (const phrase of lower.matchAll(AVAILABILITY_RE)) {
     const phraseIndex = phrase.index!
+    if (UNAVAILABLE_RE.test(lower.slice(Math.max(0, phraseIndex - 3), phraseIndex + 35))) continue
     for (const term of terms) {
       if (Math.abs(term.index - phraseIndex) > QUOTA_TERM_WINDOW) continue
       const between = lower.slice(Math.min(phraseIndex, term.index), Math.max(phraseIndex, term.index))
       if (EXHAUSTION_WORD_RE.test(between)) continue
-      if (!exhausted.has(term.word)) return true
+      if (!exhausted.has(term.index)) return true
     }
   }
   return false
