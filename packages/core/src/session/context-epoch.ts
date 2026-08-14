@@ -1,6 +1,6 @@
 export * as SessionContextEpoch from "./context-epoch"
 
-import { eq } from "drizzle-orm"
+import { eq, sql } from "drizzle-orm"
 import { DateTime, Effect, Schema } from "effect"
 import type { Database } from "../database/database"
 import { EventV2 } from "../event"
@@ -112,6 +112,10 @@ export const reset = Effect.fn("SessionContextEpoch.reset")(function* (
   db: DatabaseService,
   sessionID: SessionSchema.ID,
 ) {
+  const table = yield* db
+    .get(sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_context_epoch'`)
+    .pipe(Effect.orDie)
+  if (!table) return
   yield* db
     .delete(SessionContextEpochTable)
     .where(eq(SessionContextEpochTable.session_id, sessionID))

@@ -5,6 +5,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { EventV2 } from "@opencode-ai/core/event"
+import { EventRetention } from "@opencode-ai/core/event/retention"
 import { EventTable } from "@opencode-ai/core/event/sql"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { Project } from "@opencode-ai/core/project"
@@ -19,12 +20,20 @@ import { SessionMessageUpdater } from "@opencode-ai/core/session/message-updater
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionInput } from "@opencode-ai/core/session/input"
-import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
+import {
+  SessionContextEpochTable,
+  SessionInputTable,
+  SessionMessageTable,
+  SessionTable,
+} from "@opencode-ai/core/session/sql"
 import { testEffect } from "./lib/effect"
 import { Snapshot } from "@opencode-ai/core/snapshot"
 import { Location } from "@opencode-ai/core/location"
 
 const it = testEffect(AppNodeBuilder.build(LayerNode.group([Database.node, EventV2.node, SessionProjector.node])))
+const compatibilityIt = testEffect(
+  AppNodeBuilder.build(LayerNode.group([Database.node, EventV2.node, EventRetention.node, SessionProjector.node])),
+)
 const sessionsLayer = AppNodeBuilder.build(SessionV2.node, [[SessionExecution.node, SessionExecution.noopLayer]])
 const sessionID = SessionV2.ID.make("ses_projector_test")
 const created = DateTime.makeUnsafe(0)
@@ -45,7 +54,7 @@ const assistantRow = (
 }
 
 describe("SessionProjector", () => {
-  it.effect("projects moved sessions without the transitional context epoch table", () =>
+  compatibilityIt.effect("projects moved sessions without the transitional context epoch table", () =>
     Effect.gen(function* () {
       const { db } = yield* Database.Service
       const events = yield* EventV2.Service
@@ -78,6 +87,44 @@ describe("SessionProjector", () => {
     }),
   )
 
+  compatibilityIt.effect("projects committed reverts without the transitional context epoch table", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const events = yield* EventV2.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+        .run()
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: Project.ID.global,
+          slug: "test",
+          directory: "/project",
+          title: "test",
+          version: "test",
+        })
+        .run()
+      const boundary = SessionMessage.ID.make("msg_boundary")
+      yield* db
+        .insert(SessionMessageTable)
+        .values([assistantRow(boundary, 1), assistantRow(SessionMessage.ID.make("msg_later"), 2)])
+        .run()
+      yield* db.run(sql`DROP TABLE session_context_epoch`)
+
+      yield* events.publish(SessionEvent.RevertEvent.Committed, {
+        sessionID,
+        messageID: boundary,
+        timestamp: DateTime.makeUnsafe(1),
+      })
+
+      expect(
+        (yield* db.select({ id: SessionMessageTable.id }).from(SessionMessageTable).all()).map((row) => row.id),
+      ).toEqual([boundary])
+    }),
+  )
+
   it.effect("projects staged, cleared, and committed reverts", () =>
     Effect.gen(function* () {
       const db = (yield* Database.Service).db
@@ -100,6 +147,10 @@ describe("SessionProjector", () => {
       yield* db
         .insert(SessionMessageTable)
         .values([assistantRow(boundary, 1), assistantRow(SessionMessage.ID.make("msg_later"), 2)])
+        .run()
+      yield* db
+        .insert(SessionContextEpochTable)
+        .values({ session_id: sessionID, baseline: "context", snapshot: {}, baseline_seq: 2 })
         .run()
       const events = yield* EventV2.Service
       yield* events.publish(SessionEvent.RevertEvent.Staged, {
@@ -127,6 +178,13 @@ describe("SessionProjector", () => {
       expect(
         (yield* db.select({ id: SessionMessageTable.id }).from(SessionMessageTable).all()).map((row) => row.id),
       ).toEqual([boundary])
+      expect(
+        yield* db
+          .select()
+          .from(SessionContextEpochTable)
+          .where(eq(SessionContextEpochTable.session_id, sessionID))
+          .get(),
+      ).toBeUndefined()
     }),
   )
 
