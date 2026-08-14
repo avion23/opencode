@@ -460,11 +460,14 @@ const layer = Layer.effect(
       const prompt = [nextPrompt, "The following is the conversation history:", conversation]
         .filter(Boolean)
         .join("\n\n")
+      // The default prompt already embeds the selected conversation. A plugin
+      // replacement does not, so retain the existing append there exactly once.
+      const requestPrompt = compacting.prompt ? prompt : nextPrompt
       // The actual request prepends the compaction agent's system prompt (see
       // LLMRequestPrep.prepare), so it must count against the model window too.
       const systemPrompt = [agent.prompt, userMessage.system].filter(Boolean).join("\n")
       const capacity = usable({ cfg, model, outputTokenMax: flags.outputTokenMax })
-      const estimate = Token.estimate(prompt) + (systemPrompt ? Token.estimate(systemPrompt) : 0)
+      const estimate = Token.estimate(requestPrompt) + (systemPrompt ? Token.estimate(systemPrompt) : 0)
       // Fail fast when the model has a known context limit but no usable
       // capacity (reserved >= input window, or the output reservation consumes
       // all of it) — the oversized request would otherwise stream and fail at
@@ -498,7 +501,7 @@ const layer = Layer.effect(
             content: [
               {
                 type: "text",
-text: compacting.prompt ? prompt : nextPrompt,
+                text: requestPrompt,
               },
             ],
           },

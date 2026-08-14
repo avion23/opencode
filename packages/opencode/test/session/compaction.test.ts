@@ -2018,6 +2018,41 @@ describe("session.compaction context-fit preflight", () => {
   )
 
   itCompaction.instance(
+    "streams when the request fits but appending its embedded conversation again would not",
+    () => {
+      const stub = llm()
+      let streamed = false
+      stub.push(
+        reply("summary", () => {
+          streamed = true
+        }),
+      )
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const msg = yield* createUserMessage(session.id, "x".repeat(4_000))
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(result).toBe("continue")
+        expect(streamed).toBe(true)
+      }).pipe(
+        withCompaction({
+          llm: stub.llmLayer,
+          provider: ProviderTest.fake({ model: createModel({ context: 2_200, output: 100 }) }),
+        }),
+      )
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
     "counts the compaction system prompt against the model window",
     () => {
       const stub = llm()
