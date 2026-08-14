@@ -17,7 +17,7 @@ import { Session as SessionNs } from "@/session/session"
 import { SessionID } from "@/session/schema"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { EventSequenceTable } from "@opencode-ai/core/event/sql"
+import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, provideTmpdirInstance, requireInstance, TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -1077,6 +1077,65 @@ describe("workspace CRUD", () => {
             expect(calls[4].json).toEqual({ sessionID: session.id })
             expect((yield* sessionSvc.get(session.id)).title).toBe("from source history")
             expect(yield* sessionSequenceOwner(session.id)).toBe(target.id)
+          }),
+        { git: true },
+      )
+    })
+  })
+
+  it.live("sessionWarp refuses a non-replayable session before remote side effects", () => {
+    const calls: FetchCall[] = []
+    return Effect.gen(function* () {
+      yield* HttpServer.serveEffect()(
+        Effect.gen(function* () {
+          const req = yield* HttpServerRequest.HttpServerRequest
+          const bodyText = yield* req.text
+          calls.push({
+            url: new URL(req.url, "http://localhost"),
+            method: req.method,
+            headers: new Headers(req.headers),
+            bodyText,
+            json: bodyText ? JSON.parse(bodyText) : undefined,
+          })
+          return yield* HttpServerResponse.json({ ok: true })
+        }),
+      )
+      const url = yield* serverUrl()
+      yield* provideTmpdirInstance(
+        () =>
+          Effect.gen(function* () {
+            const workspace = yield* Workspace.Service
+            const sessionSvc = yield* SessionNs.Service
+            const instance = yield* requireInstance
+            const type = unique("warp-non-replayable")
+            const target = workspaceInfo(instance.project.id, type)
+            yield* insertWorkspace(target)
+            registerAdapter(instance.project.id, type, remoteAdapter(`${url}/warp-target`).adapter)
+            const session = yield* sessionSvc.create({})
+            const { db } = yield* Database.Service
+            yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, session.id)).run().pipe(Effect.orDie)
+
+            const error = yield* Effect.flip(
+              workspace.sessionWarp({ workspaceID: target.id, sessionID: session.id, copyChanges: true }),
+            )
+
+            expect(error).toMatchObject({
+              _tag: "WorkspaceSessionEventsNotReplayableError",
+              sessionID: session.id,
+            })
+            expect(
+              calls.filter((call) =>
+                ["/vcs/apply", "/sync/replay", "/sync/steal"].some((path) => call.url.pathname.endsWith(path)),
+              ),
+            ).toEqual([])
+            expect(
+              (yield* db
+                .select({ workspaceID: SessionTable.workspace_id })
+                .from(SessionTable)
+                .where(eq(SessionTable.id, session.id))
+                .get()
+                .pipe(Effect.orDie))?.workspaceID,
+            ).toBeNull()
           }),
         { git: true },
       )

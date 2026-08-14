@@ -1,6 +1,6 @@
 export * as EventRetention from "./retention"
 
-import { and, eq, isNull, like, lt } from "drizzle-orm"
+import { and, eq, inArray, isNull, like, lt } from "drizzle-orm"
 import { Duration, Effect, Layer, Schedule } from "effect"
 import { Database } from "../database/database"
 import { makeGlobalNode } from "../effect/app-node"
@@ -11,7 +11,7 @@ import { EventTable } from "./sql"
  * Durable `message.part.updated.*` rows are write-only once projected into the `part` table, so bound how long
  * they are retained. Only settled sessions are touched, and only ones never bound to a workspace: the workspace
  * sync replays per-aggregate event streams in strict sequence order, so workspace-bound aggregates must keep their
- * rows contiguous.
+ * rows contiguous. Unbound streams can become non-replayable after retention.
  */
 export const RETENTION = Duration.days(7)
 export const BATCH_SIZE = 5000
@@ -39,6 +39,13 @@ export const prune = Effect.fn("EventRetention.prune")(function* (options: {
           and(
             eq(EventTable.aggregate_id, session.id),
             like(EventTable.type, "message.part.updated.%"),
+            inArray(
+              EventTable.aggregate_id,
+              db
+                .select({ id: SessionTable.id })
+                .from(SessionTable)
+                .where(and(lt(SessionTable.time_updated, cutoff), isNull(SessionTable.workspace_id))),
+            ),
           ),
         )
         .returning({ id: EventTable.id })

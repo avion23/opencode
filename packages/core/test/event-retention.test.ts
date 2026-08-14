@@ -5,7 +5,7 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventRetention } from "@opencode-ai/core/event/retention"
-import { EventTable } from "@opencode-ai/core/event/sql"
+import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionV2 } from "@opencode-ai/core/session"
@@ -87,9 +87,33 @@ describe("EventRetention", () => {
         partID: SessionV1.PartID.ascending("prt_removed"),
       })
 
+      const latest = (yield* db
+        .select({ seq: EventSequenceTable.seq })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, old))
+        .get()
+        .pipe(Effect.orDie))?.seq
+
       const deleted = yield* EventRetention.prune({ olderThan: Duration.days(7), batch: 2 })
 
       expect(deleted).toBe(3)
+      expect(
+        (yield* db
+          .select({ seq: EventSequenceTable.seq })
+          .from(EventSequenceTable)
+          .where(eq(EventSequenceTable.aggregate_id, old))
+          .get()
+          .pipe(Effect.orDie))?.seq,
+      ).toBe(latest)
+      const retained = yield* db
+        .select({ seq: EventTable.seq })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, old))
+        .orderBy(EventTable.seq)
+        .all()
+        .pipe(Effect.orDie)
+      expect(retained).toHaveLength(1)
+      expect(retained.some((row, index) => row.seq !== index)).toBe(true)
       expect(
         yield* db
           .select({ type: EventTable.type })

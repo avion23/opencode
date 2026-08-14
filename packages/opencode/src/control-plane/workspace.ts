@@ -97,6 +97,14 @@ export class SessionEventsNotFoundError extends Schema.TaggedErrorClass<SessionE
   },
 ) {}
 
+export class SessionEventsNotReplayableError extends Schema.TaggedErrorClass<SessionEventsNotReplayableError>()(
+  "WorkspaceSessionEventsNotReplayableError",
+  {
+    message: Schema.String,
+    sessionID: SessionID,
+  },
+) {}
+
 export class SessionWarpHttpError extends Schema.TaggedErrorClass<SessionWarpHttpError>()(
   "WorkspaceSessionWarpHttpError",
   {
@@ -122,6 +130,7 @@ type CreateError = Auth.AuthError
 type SessionWarpError =
   | WorkspaceNotFoundError
   | SessionEventsNotFoundError
+  | SessionEventsNotReplayableError
   | SessionWarpHttpError
   | Vcs.PatchApplyError
   | HttpClientError.HttpClientError
@@ -565,6 +574,43 @@ const layer = Layer.effect(
           .get()
           .pipe(Effect.orDie)
 
+        const destination = input.workspaceID ? yield* get(input.workspaceID) : undefined
+        if (input.workspaceID && !destination)
+          return yield* new WorkspaceNotFoundError({
+            message: `Workspace not found: ${input.workspaceID}`,
+            workspaceID: input.workspaceID,
+          })
+        const destinationTarget = destination ? yield* WorkspaceAdapterRuntime.target(destination) : undefined
+
+        if (destinationTarget?.type === "remote")
+          yield* Effect.gen(function* () {
+            if (current && !current.workspaceID) yield* session.touch(input.sessionID)
+            const latest = (yield* db
+              .select({ seq: EventSequenceTable.seq })
+              .from(EventSequenceTable)
+              .where(eq(EventSequenceTable.aggregate_id, input.sessionID))
+              .get()
+              .pipe(Effect.orDie))?.seq
+            const rows = yield* db
+              .select({
+                id: EventTable.id,
+                aggregateID: EventTable.aggregate_id,
+                seq: EventTable.seq,
+                type: EventTable.type,
+                data: EventTable.data,
+              })
+              .from(EventTable)
+              .where(eq(EventTable.aggregate_id, input.sessionID))
+              .orderBy(asc(EventTable.seq))
+              .all()
+              .pipe(Effect.orDie)
+            if (latest === undefined || rows.length !== latest + 1 || rows.some((row, index) => row.seq !== index))
+              return yield* new SessionEventsNotReplayableError({
+                message: `Events are not fully replayable for session: ${input.sessionID}`,
+                sessionID: input.sessionID,
+              })
+          })
+
         if (current?.workspaceID) {
           const previous = yield* get(current.workspaceID)
           if (previous) {
@@ -627,14 +673,8 @@ const layer = Layer.effect(
         }
 
         const workspaceID = input.workspaceID
-        const space = yield* get(workspaceID)
-        if (!space)
-          return yield* new WorkspaceNotFoundError({
-            message: `Workspace not found: ${workspaceID}`,
-            workspaceID,
-          })
-
-        const target = yield* WorkspaceAdapterRuntime.target(space)
+        const space = destination!
+        const target = destinationTarget!
 
         if (target.type === "local") {
           yield* session.setWorkspace({ sessionID: input.sessionID, workspaceID: input.workspaceID })
@@ -655,11 +695,6 @@ const layer = Layer.effect(
           .orderBy(asc(EventTable.seq))
           .all()
           .pipe(Effect.orDie)
-        if (rows.length === 0)
-          return yield* new SessionEventsNotFoundError({
-            message: `No events found for session: ${input.sessionID}`,
-            sessionID: input.sessionID,
-          })
 
         const batches = Iterable.chunksOf(rows, 10)
         const total = Iterable.size(batches)
