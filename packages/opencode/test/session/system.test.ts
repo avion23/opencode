@@ -9,6 +9,7 @@ import type { Provider } from "../../src/provider/provider"
 import { SystemPrompt } from "../../src/session/system"
 import { MCP } from "../../src/mcp"
 import { testEffect } from "../lib/effect"
+import PROMPT_KIMI from "../../src/session/prompt/kimi.txt"
 
 const skills: Skill.Info[] = [
   {
@@ -105,7 +106,7 @@ describe("session.system", () => {
   test("selects the Kimi prompt for official provider model IDs", () => {
     for (const providerID of ["kimi-for-coding", "moonshotai", "moonshotai-cn"]) {
       const prompt = SystemPrompt.provider({ providerID, api: { id: "k3" } } as Provider.Model)[0]
-      expect(prompt).toContain("# Prompt and Tool Use")
+      expect(prompt).toBe(PROMPT_KIMI)
     }
   })
 
