@@ -2871,7 +2871,18 @@ describe("SessionRunnerLLM", () => {
           input: Schema.Struct({}),
           output: Schema.Struct({}),
           execute: (_, context) =>
-            questions.ask({ sessionID: context.sessionID, questions: [] }).pipe(Effect.as({}), Effect.orDie),
+            questions
+              .ask({
+                sessionID: context.sessionID,
+                questions: [
+                  {
+                    question: "Continue?",
+                    header: "Continue",
+                    options: [{ label: "Yes", description: "Proceed" }],
+                  },
+                ],
+              })
+              .pipe(Effect.as({}), Effect.orDie),
         }),
       })
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Ask then stop" }), resume: false })
