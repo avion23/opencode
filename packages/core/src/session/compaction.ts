@@ -145,28 +145,15 @@ export const select = (
   if (conversation.length === 0) return
   let total = 0
   let split = conversation.length
-  let headEnd = conversation.length
-  let splitPrefix = ""
-  let splitSuffix = ""
   for (let index = conversation.length - 1; index >= 0; index--) {
     const next = total + Token.estimate(conversation[index])
-    if (next > tokens) {
-      const remaining = Math.max(0, tokens - total) * 4
-      if (remaining > 0) {
-        splitPrefix = conversation[index].slice(0, -remaining)
-        splitSuffix = conversation[index].slice(-remaining)
-        split = index + 1
-        headEnd = index
-      }
-      break
-    }
+    if (next > tokens) break
     total = next
     split = index
-    headEnd = index
   }
   return {
-    head: [...conversation.slice(0, headEnd), splitPrefix].filter(Boolean).join("\n\n"),
-    recent: [splitSuffix, ...conversation.slice(split)].filter(Boolean).join("\n\n"),
+    head: conversation.slice(0, split).join("\n\n"),
+    recent: conversation.slice(split).join("\n\n"),
   }
 }
 
