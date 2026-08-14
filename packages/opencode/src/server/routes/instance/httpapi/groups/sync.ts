@@ -19,14 +19,44 @@ export const ReplayEvent = Schema.Struct({
 export const ReplayPayload = Schema.Struct({
   directory: Schema.String,
   events: Schema.NonEmptyArray(ReplayEvent),
+  /** The owner that created the replay snapshot. The destination transfers it during steal. */
+  ownerID: Schema.String,
+  /** Identifies the in-progress warp so a failed replay can be rolled back. */
+  warpID: Schema.optional(EventV2.ID),
 })
 export const ReplayResponse = Schema.Struct({
   sessionID: Schema.String,
 })
 export const SessionPayload = Schema.Struct({
   sessionID: SessionID,
+  seq: NonNegativeInt,
+  warpID: EventV2.ID,
+  /** The owner currently fencing the aggregate, before compare-and-transfer. */
+  ownerID: Schema.String,
 })
-export const HistoryPayload = Schema.Record(Schema.String, NonNegativeInt)
+export const StealResponse = Schema.Struct({
+  sessionID: SessionID,
+  event: ReplayEvent,
+})
+export const WorkspaceHistoryPayload = Schema.Struct({
+  scope: Schema.Literal("workspace"),
+})
+export const AggregateHistoryPayload = Schema.Struct({
+  scope: Schema.Literal("aggregate"),
+  // -1 is the state fence used when the caller has no local event yet.
+  state: Schema.Record(Schema.String, Schema.Int.check(Schema.isGreaterThanOrEqualTo(-1))),
+  /** Read history only when this owner still owns the aggregate. */
+  ownerID: Schema.optional(Schema.String),
+  /** Fence one aggregate while returning its newest history. */
+  fence: Schema.optional(
+    Schema.Struct({
+      sessionID: SessionID,
+      /** The owner to install after the history snapshot is read. */
+      ownerID: Schema.String,
+    }),
+  ),
+})
+export const HistoryPayload = Schema.Union([WorkspaceHistoryPayload, AggregateHistoryPayload])
 export const HistoryEvent = Schema.Struct({
   id: EventV2.ID,
   aggregate_id: Schema.String,
@@ -60,7 +90,7 @@ export const SyncApi = HttpApi.make("sync")
           query: WorkspaceRoutingQuery,
           payload: ReplayPayload,
           success: described(ReplayResponse, "Replayed sync events"),
-          error: HttpApiError.BadRequest,
+          error: [HttpApiError.BadRequest, HttpApiError.Conflict],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "sync.replay",
@@ -71,8 +101,8 @@ export const SyncApi = HttpApi.make("sync")
         HttpApiEndpoint.post("steal", SyncPaths.steal, {
           query: WorkspaceRoutingQuery,
           payload: SessionPayload,
-          success: described(SessionPayload, "Session stolen into workspace"),
-          error: HttpApiError.BadRequest,
+          success: described(StealResponse, "Session stolen into workspace"),
+          error: [HttpApiError.BadRequest, HttpApiError.Conflict],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "sync.steal",
@@ -84,13 +114,13 @@ export const SyncApi = HttpApi.make("sync")
           query: WorkspaceRoutingQuery,
           payload: HistoryPayload,
           success: described(Schema.Array(HistoryEvent), "Sync events"),
-          error: HttpApiError.BadRequest,
+          error: [HttpApiError.BadRequest, HttpApiError.Conflict],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "sync.history.list",
             summary: "List sync events",
             description:
-              "List sync events for all aggregates. Keys are aggregate IDs the client already knows about, values are the last known sequence ID. Events with seq > value are returned for those aggregates. Aggregates not listed in the input get their full history.",
+              "List newer sync events for the requested aggregates. Keys are aggregate IDs and values are the last known sequence ID.",
           }),
         ),
       )

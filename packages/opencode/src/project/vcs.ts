@@ -265,6 +265,7 @@ export type FileStatus = Schema.Schema.Type<typeof FileStatus>
 
 export const ApplyInput = Schema.Struct({
   patch: Schema.String,
+  reverse: Schema.optional(Schema.Boolean),
 })
 export type ApplyInput = Schema.Schema.Type<typeof ApplyInput>
 
@@ -405,7 +406,7 @@ const layer: Layer.Layer<Service, never, Git.Service | EventV2Bridge.Service> = 
             reason: "non-git",
           })
         }
-        const applied = yield* git.applyPatch(ctx.directory, input.patch)
+        const applied = yield* git.applyPatch(ctx.directory, input.patch, input.reverse)
         if (applied.exitCode !== 0) {
           return yield* new PatchApplyError({
             message: "Patch can't be applied",

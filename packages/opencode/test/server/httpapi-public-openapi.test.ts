@@ -25,7 +25,10 @@ type OpenApiOperation = {
     readonly schema?: { readonly type?: string }
   }>
   readonly responses?: Record<string, OpenApiResponse>
-  readonly requestBody?: { readonly required?: boolean }
+  readonly requestBody?: {
+    readonly required?: boolean
+    readonly content?: Record<string, { readonly schema?: OpenApiSchema }>
+  }
   readonly security?: unknown
 }
 type OpenApiPathItem = Partial<Record<Method, OpenApiOperation>>
@@ -143,6 +146,30 @@ describe("PublicApi OpenAPI v2 errors", () => {
       "/api/session/{sessionID}/question/{requestID}/reply",
     ]) {
       expect(spec.paths[path]?.post?.requestBody?.required, path).toBe(true)
+    }
+  })
+
+  test("requires the complete sync steal contract in memory and on disk", async () => {
+    const specs = [
+      OpenApi.fromApi(PublicApi) as OpenApiSpec,
+      (await Bun.file(new URL("../../../sdk/openapi.json", import.meta.url)).json()) as OpenApiSpec,
+    ]
+
+    for (const spec of specs) {
+      const operation = spec.paths["/sync/steal"]?.post
+      const request = operation?.requestBody?.content?.["application/json"]?.schema
+      const response = operation?.responses?.["200"]?.content?.["application/json"]?.schema
+
+      expect(operation?.requestBody?.required).toBe(true)
+      expect(request?.$ref ? spec.components.schemas[componentName(request.$ref)]?.required : request?.required).toEqual([
+        "sessionID",
+        "seq",
+        "warpID",
+      ])
+      expect(response?.$ref ? spec.components.schemas[componentName(response.$ref)]?.required : response?.required).toEqual([
+        "sessionID",
+        "event",
+      ])
     }
   })
 

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, test } from "bun:test"
+import { afterAll, describe, expect, test } from "bun:test"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
@@ -33,6 +33,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { SystemPrompt } from "../../src/session/system"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -52,8 +53,36 @@ const usage = (input: ConstructorParameters<typeof Usage>[0]) => new Usage(input
 
 const basicUsage = () => usage({ inputTokens: 1, outputTokens: 1, totalTokens: 2 })
 
-afterEach(() => {
-  mock.restore()
+const providerRequests: Array<Record<string, unknown>> = []
+const providerServer = Bun.serve({
+  port: 0,
+  async fetch(request) {
+    providerRequests.push((await request.json()) as Record<string, unknown>)
+    const body = [
+      `data: ${JSON.stringify({
+        id: "chatcmpl-compaction-test",
+        object: "chat.completion.chunk",
+        choices: [{ index: 0, delta: { role: "assistant" } }],
+      })}`,
+      `data: ${JSON.stringify({
+        id: "chatcmpl-compaction-test",
+        object: "chat.completion.chunk",
+        choices: [{ index: 0, delta: { content: "summary" } }],
+      })}`,
+      `data: ${JSON.stringify({
+        id: "chatcmpl-compaction-test",
+        object: "chat.completion.chunk",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      })}`,
+      "data: [DONE]",
+      "",
+    ].join("\n\n")
+    return new Response(body, { headers: { "Content-Type": "text/event-stream" } })
+  },
+})
+
+afterAll(() => {
+  providerServer.stop()
 })
 
 function createModel(opts: {
@@ -61,6 +90,7 @@ function createModel(opts: {
   output: number
   input?: number
   id?: string
+  apiID?: string
   providerID?: string
   cost?: Provider.Model["cost"]
   npm?: string
@@ -83,7 +113,7 @@ function createModel(opts: {
       input: { text: true, image: false, audio: false, video: false },
       output: { text: true, image: false, audio: false, video: false },
     },
-    api: { npm: opts.npm ?? "@ai-sdk/anthropic" },
+    api: { id: opts.apiID ?? opts.id ?? "test-model", npm: opts.npm ?? "@ai-sdk/anthropic" },
     options: {},
   } as Provider.Model
 }
@@ -105,6 +135,45 @@ function providerWithModels(models: Provider.Model[]) {
       return Effect.die(new Error(`Unknown test model: ${providerID}/${modelID}`))
     }),
   })
+}
+
+function realConfig(model: Provider.Model, compactionPrompt?: string) {
+  const base = Schema.decodeUnknownSync(ConfigV1.Info)({}) as ConfigV1.Info
+  return Layer.succeed(
+    Config.Service,
+    TestConfig.make({
+      get: () =>
+        Effect.succeed({
+          ...base,
+          enabled_providers: [model.providerID],
+          provider: {
+            [model.providerID]: {
+              name: "Test",
+              npm: model.api.npm,
+              options: {
+                apiKey: "test-key",
+                baseURL: `${providerServer.url.origin}/v1`,
+              },
+              models: {
+                [model.id]: {
+                  id: model.api.id,
+                  name: model.name,
+                  attachment: model.capabilities.attachment,
+                  reasoning: model.capabilities.reasoning,
+                  temperature: model.capabilities.temperature,
+                  tool_call: model.capabilities.toolcall,
+                  release_date: "2025-01-01",
+                  limit: model.limit,
+                  cost: { input: 0, output: 0 },
+                  options: {},
+                },
+              },
+            },
+          },
+          ...(compactionPrompt === undefined ? {} : { agent: { compaction: { prompt: compactionPrompt } } }),
+        } satisfies ConfigV1.Info),
+    }),
+  )
 }
 
 function createUserMessage(sessionID: SessionID, text: string) {
@@ -292,6 +361,7 @@ type CompactionProcessOptions = {
   plugin?: Layer.Layer<Plugin.Service>
   provider?: ReturnType<typeof wide>
   config?: Layer.Layer<Config.Service>
+  real?: boolean
 }
 
 function withCompaction(options?: CompactionProcessOptions) {
@@ -299,6 +369,14 @@ function withCompaction(options?: CompactionProcessOptions) {
 }
 
 function compactionProcessLayer(options?: CompactionProcessOptions) {
+  if (options?.real) {
+    return AppNodeBuilder.build(compactionTestNode, [
+      [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
+      [SessionSummary.node, summary],
+      ...(options?.plugin ? ([[Plugin.node, options.plugin]] as const) : []),
+      ...(options?.config ? ([[Config.node, options.config]] as const) : []),
+    ])
+  }
   const replacements: LayerNode.Replacements = [
     [Provider.node, (options?.provider ?? wide()).layer],
     [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
@@ -314,7 +392,7 @@ function compactionProcessLayer(options?: CompactionProcessOptions) {
   }
   return AppNodeBuilder.build(compactionTestNode, [
     ...replacements,
-    [LLM.node, options.llm],
+    ...(options?.llm ? ([[LLM.node, options.llm]] as const) : []),
     ...(options?.plugin ? ([[Plugin.node, options.plugin]] as const) : []),
     ...(options?.config ? ([[Config.node, options.config]] as const) : []),
   ])
@@ -419,6 +497,62 @@ function compactionContext(context: string) {
     list: () => Effect.succeed([]),
     init: () => Effect.void,
   })
+}
+
+function compactionPrompt(prompt: string) {
+  return Layer.succeed(
+    Plugin.Service,
+    Plugin.Service.of({
+      trigger: <Name extends string, Input, Output>(name: Name, _input: Input, output: Output) => {
+        if (name !== "experimental.session.compacting") return Effect.succeed(output)
+        return Effect.sync(() => {
+          ;(output as { prompt?: string }).prompt = prompt
+          return output
+        })
+      },
+      list: () => Effect.succeed([]),
+      init: () => Effect.void,
+    }),
+  )
+}
+
+function systemTransform(system: string, systems?: string[][]) {
+  return Layer.succeed(
+    Plugin.Service,
+    Plugin.Service.of({
+      trigger: <Name extends string, Input, Output>(name: Name, _input: Input, output: Output) => {
+        if (name !== "experimental.chat.system.transform") return Effect.succeed(output)
+        return Effect.sync(() => {
+          const transformed = (output as { system: string[] }).system
+          transformed.push(system)
+          systems?.push([...transformed])
+          return output
+        })
+      },
+      list: () => Effect.succeed([]),
+      init: () => Effect.void,
+    }),
+  )
+}
+
+function statefulSystemTransform(systems: string[][]) {
+  return Layer.succeed(
+    Plugin.Service,
+    Plugin.Service.of({
+      trigger: <Name extends string, Input, Output>(name: Name, _input: Input, output: Output) => {
+        if (name !== "experimental.chat.system.transform") return Effect.succeed(output)
+        return Effect.sync(() => {
+          const text = systems.length === 0 ? "first transformed system" : "second transformed system"
+          const system = (output as { system: string[] }).system
+          system.push(text)
+          systems.push([...system])
+          return output
+        })
+      },
+      list: () => Effect.succeed([]),
+      init: () => Effect.void,
+    }),
+  )
 }
 
 describe("session.compaction.isOverflow", () => {
@@ -2088,6 +2222,148 @@ describe("session.compaction context-fit preflight", () => {
         withCompaction({
           llm: stub.llmLayer,
           provider: ProviderTest.fake({ model: createModel({ context: 500, output: 100 }) }),
+        }),
+      )
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "counts plugin-transformed system text against the model window",
+    () => {
+      const systems: string[][] = []
+      const model = createModel({
+        context: 2_000,
+        output: 100,
+        npm: "@ai-sdk/openai-compatible",
+        apiID: "test-model",
+      })
+      providerRequests.length = 0
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const msg = yield* createUserMessage(session.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(result).toBe("stop")
+        expect(systems).toHaveLength(1)
+        expect(providerRequests).toHaveLength(0)
+        const summary = (yield* ssn.messages({ sessionID: session.id })).find(
+          (item) => item.info.role === "assistant" && item.info.summary,
+        )
+        expect(summary?.info.role).toBe("assistant")
+        if (summary?.info.role === "assistant") {
+          expect(summary.info.finish).toBe("error")
+          expect(summary.info.error?.name).toBe("ContextOverflowError")
+        }
+      }).pipe(
+        withCompaction({
+          real: true,
+          plugin: systemTransform("x".repeat(10_000), systems),
+          config: realConfig(model),
+        }),
+      )
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "reuses the transformed system text during request preparation",
+    () => {
+      const systems: string[][] = []
+      const model = createModel({
+        context: 100_000,
+        output: 32_000,
+        npm: "@ai-sdk/openai-compatible",
+        apiID: "test-model",
+      })
+      const plugin = statefulSystemTransform(systems)
+      providerRequests.length = 0
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const msg = yield* createUserMessage(session.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(result).toBe("continue")
+        expect(systems).toHaveLength(1)
+        expect(providerRequests).toHaveLength(1)
+        const messages = providerRequests[0]?.messages
+        expect(Array.isArray(messages)).toBe(true)
+        const sent = (messages as Array<{ role: string; content: unknown }>)
+          .filter((message) => message.role === "system")
+          .map((message) => message.content)
+        expect(sent).toEqual(systems[0])
+        expect(sent.at(-1)).toBe("first transformed system")
+      }).pipe(
+        withCompaction({
+          real: true,
+          plugin,
+          config: realConfig(model),
+        }),
+      )
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "counts the provider system prompt when the compaction prompt is empty",
+    () => {
+      const prompt = ["compact", "The following is the conversation history:", "[User]: hello"].join("\n\n")
+      const output = 100
+      const model = createModel({
+        context: Token.estimate(prompt) + output,
+        output,
+        npm: "@ai-sdk/openai-compatible",
+        apiID: "claude-test",
+      })
+      const providerPrompt = SystemPrompt.provider(model).join("\n")
+      expect(Token.estimate(providerPrompt)).toBeGreaterThan(0)
+      expect(Token.estimate(prompt) + Token.estimate(providerPrompt)).toBeGreaterThan(model.limit.context - output)
+      providerRequests.length = 0
+
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const msg = yield* createUserMessage(session.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(result).toBe("stop")
+        expect(providerRequests).toHaveLength(0)
+        const summary = (yield* ssn.messages({ sessionID: session.id })).find(
+          (item) => item.info.role === "assistant" && item.info.summary,
+        )
+        expect(summary?.info.role).toBe("assistant")
+        if (summary?.info.role === "assistant") {
+          expect(summary.info.finish).toBe("error")
+          expect(summary.info.error?.name).toBe("ContextOverflowError")
+        }
+      }).pipe(
+        withCompaction({
+          real: true,
+          plugin: compactionPrompt("compact"),
+          config: realConfig(model, ""),
         }),
       )
     },

@@ -2604,6 +2604,10 @@ export type SessionBusyError = {
   message: string
 }
 
+export type EffectHttpApiErrorConflict = {
+  _tag: "Conflict"
+}
+
 export type EventTuiPromptAppend = {
   type: "tui.prompt.append"
   properties: {
@@ -10549,8 +10553,10 @@ export type SyncReplayResponses = {
 export type SyncReplayResponse = SyncReplayResponses[keyof SyncReplayResponses]
 
 export type SyncStealData = {
-  body?: {
+  body: {
     sessionID: string
+    seq: number
+    warpID: string
   }
   path?: never
   query?: {
@@ -10565,6 +10571,10 @@ export type SyncStealErrors = {
    * BadRequest | InvalidRequestError
    */
   400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * Conflict
+   */
+  409: EffectHttpApiErrorConflict
 }
 
 export type SyncStealError = SyncStealErrors[keyof SyncStealErrors]
@@ -10575,6 +10585,15 @@ export type SyncStealResponses = {
    */
   200: {
     sessionID: string
+    event: {
+      id: string
+      aggregateID: string
+      seq: number
+      type: string
+      data: {
+        [key: string]: unknown
+      }
+    }
   }
 }
 

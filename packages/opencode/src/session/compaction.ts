@@ -12,7 +12,7 @@ import { Plugin } from "@/plugin"
 import { Config } from "@/config/config"
 import { NotFoundError } from "@/storage/storage"
 
-import { Effect, Layer, Context } from "effect"
+import { Cause, Effect, Layer, Context } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { isOverflow as overflow, usable } from "./overflow"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
@@ -22,6 +22,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
+import { LLMRequestPrep } from "./llm/request"
 
 export const Event = SessionCompactionEvent
 
@@ -463,9 +464,31 @@ const layer = Layer.effect(
       // The default prompt already embeds the selected conversation. A plugin
       // replacement does not, so retain the existing append there exactly once.
       const requestPrompt = compacting.prompt ? prompt : nextPrompt
-      // The actual request prepends the compaction agent's system prompt (see
-      // LLMRequestPrep.prepare), so it must count against the model window too.
-      const systemPrompt = [agent.prompt, userMessage.system].filter(Boolean).join("\n")
+      // Prepare the system text before the preflight so the exact same result
+      // is reused by the provider request. This also applies the provider
+      // prompt fallback when the compaction agent prompt is empty.
+      const preparedSystem = yield* LLMRequestPrep.prepareSystem({
+        user: userMessage,
+        sessionID: input.sessionID,
+        model,
+        agent,
+        system: [],
+        plugin,
+      }).pipe(
+        Effect.map((system) => ({ system })),
+        Effect.catchCauseIf(
+          (cause) => !Cause.hasInterruptsOnly(cause),
+          (cause) => Effect.succeed({ error: Cause.squash(cause) }),
+        ),
+      )
+      if ("error" in preparedSystem) {
+        msg.error = MessageV2.fromError(preparedSystem.error, { providerID: model.providerID })
+        msg.finish = "error"
+        msg.time.completed = Date.now()
+        yield* session.updateMessage(msg)
+        return "stop"
+      }
+      const systemPrompt = preparedSystem.system.join("\n")
       const capacity = usable({ cfg, model, outputTokenMax: flags.outputTokenMax })
       const estimate = Token.estimate(requestPrompt) + (systemPrompt ? Token.estimate(systemPrompt) : 0)
       // Fail fast when the model has a known context limit but no usable
@@ -495,6 +518,7 @@ const layer = Layer.effect(
         sessionID: input.sessionID,
         tools: {},
         system: [],
+        preparedSystem: preparedSystem.system,
         messages: [
           {
             role: "user",

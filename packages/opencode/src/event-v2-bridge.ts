@@ -24,6 +24,7 @@ const layer = Layer.effect(
         const workspaceID = yield* WorkspaceRef
         return yield* events.publish(definition, data, {
           ...options,
+          ownerID: options?.ownerID ?? workspaceID ?? ctx.project.id,
           location: new Location.Info({
             directory: AbsolutePath.make(ctx.directory),
             ...(workspaceID ? { workspaceID } : {}),

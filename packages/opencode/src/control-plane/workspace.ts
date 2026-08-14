@@ -1,6 +1,6 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
-import { Context, Effect, FiberMap, Iterable, Layer, Schema, Stream } from "effect"
+import { Context, Effect, Exit, FiberMap, Layer, Schedule, Schema, Stream } from "effect"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { FetchHttpClient, HttpBody, HttpClient, HttpClientError, HttpClientRequest } from "effect/unstable/http"
 import { Database } from "@opencode-ai/core/database/database"
@@ -11,6 +11,7 @@ import { Project } from "@/project/project"
 import { GlobalBus } from "@/bus/global"
 import { Auth } from "@/auth"
 import { EventV2 } from "@opencode-ai/core/event"
+import { NonNegativeInt } from "@opencode-ai/core/schema"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -34,6 +35,7 @@ import { InstanceStore } from "@/project/instance-store"
 import { WorkspaceAdapterRuntime } from "./workspace-adapter-runtime"
 import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
 import { WorkspaceEvent } from "@opencode-ai/schema/workspace-event"
+import { isCommittedSessionWarp } from "@/session/warp"
 
 export const Info = Schema.Struct({
   ...WorkspaceInfoSchema.fields,
@@ -72,6 +74,8 @@ export const SessionWarpInput = Schema.Struct({
   workspaceID: Schema.NullOr(WorkspaceV2.ID),
   sessionID: SessionID,
   copyChanges: Schema.optional(Schema.Boolean),
+  /** Set by the HTTP route to constrain a warp to its trusted project. */
+  projectID: Schema.optional(ProjectV2.ID),
 })
 export type SessionWarpInput = Schema.Schema.Type<typeof SessionWarpInput>
 
@@ -89,6 +93,14 @@ export class WorkspaceNotFoundError extends Schema.TaggedErrorClass<WorkspaceNot
   },
 ) {}
 
+export class SessionWarpAuthorizationError extends Schema.TaggedErrorClass<SessionWarpAuthorizationError>()(
+  "WorkspaceSessionWarpAuthorizationError",
+  {
+    message: Schema.String,
+    sessionID: SessionID,
+  },
+) {}
+
 export class SessionEventsNotFoundError extends Schema.TaggedErrorClass<SessionEventsNotFoundError>()(
   "WorkspaceSessionEventsNotFoundError",
   {
@@ -99,6 +111,14 @@ export class SessionEventsNotFoundError extends Schema.TaggedErrorClass<SessionE
 
 export class SessionEventsNotReplayableError extends Schema.TaggedErrorClass<SessionEventsNotReplayableError>()(
   "WorkspaceSessionEventsNotReplayableError",
+  {
+    message: Schema.String,
+    sessionID: SessionID,
+  },
+) {}
+
+export class SessionWarpConflictError extends Schema.TaggedErrorClass<SessionWarpConflictError>()(
+  "WorkspaceSessionWarpConflictError",
   {
     message: Schema.String,
     sessionID: SessionID,
@@ -129,10 +149,13 @@ export class SyncAbortedError extends Schema.TaggedErrorClass<SyncAbortedError>(
 type CreateError = Auth.AuthError
 type SessionWarpError =
   | WorkspaceNotFoundError
+  | SessionWarpAuthorizationError
   | SessionEventsNotFoundError
   | SessionEventsNotReplayableError
+  | SessionWarpConflictError
   | SessionWarpHttpError
   | Vcs.PatchApplyError
+  | SyncHttpError
   | HttpClientError.HttpClientError
 type WaitForSyncError = SyncTimeoutError | SyncAbortedError
 type SyncLoopError = SyncHttpError | HttpClientError.HttpClientError
@@ -158,6 +181,30 @@ export interface Interface {
 export class Service extends Context.Service<Service, Interface>()("@opencode/Workspace") {}
 
 export const use = serviceUse(Service)
+
+const RemoteHistoryEvent = Schema.Struct({
+  id: EventV2.ID,
+  aggregate_id: Schema.String,
+  seq: NonNegativeInt,
+  type: Schema.String,
+  data: Schema.Record(Schema.String, Schema.Unknown),
+})
+const RemoteStealResponse = Schema.Struct({
+  sessionID: Schema.String,
+  event: Schema.Struct({
+    id: EventV2.ID,
+    aggregateID: Schema.String,
+    seq: NonNegativeInt,
+    type: Schema.String,
+    data: Schema.Record(Schema.String, Schema.Unknown),
+  }),
+})
+const RemoteReplayResponse = Schema.Struct({ sessionID: Schema.String })
+const RemoteApplyResponse = Schema.Struct({ applied: Schema.Boolean })
+
+type HistoryRequest =
+  | { scope: "workspace" }
+  | { scope: "aggregate"; state: Record<string, number>; fence?: { sessionID: SessionID; ownerID: string } }
 
 const layer = Layer.effect(
   Service,
@@ -268,6 +315,7 @@ const layer = Layer.effect(
       }) => HttpClientRequest.HttpClientRequest
       fallback: A
       response?: "json" | "text"
+      strict?: boolean
     }) =>
       Effect.gen(function* () {
         if (!input.workspaceID) return yield* input.local()
@@ -284,15 +332,23 @@ const layer = Layer.effect(
 
         const response = yield* http.execute(input.remote({ workspace, target })).pipe(
           Effect.catch((error) =>
-            Effect.logWarning("workspace target request failed", {
-              workspaceID: workspace.id,
-              error: errorData(error),
-            }).pipe(Effect.as(undefined)),
+            input.strict
+              ? Effect.fail(error)
+              : Effect.logWarning("workspace target request failed", {
+                  workspaceID: workspace.id,
+                  error: errorData(error),
+                }).pipe(Effect.as(undefined)),
           ),
         )
         if (!response) return input.fallback
         if (response.status < 200 || response.status >= 300) {
           const body = yield* response.text.pipe(Effect.catch(() => Effect.succeed("")))
+          if (input.strict)
+            return yield* new SyncHttpError({
+              message: `Workspace target request failed: ${response.status} ${body}`,
+              status: response.status,
+              body,
+            })
           yield* Effect.logWarning("workspace target request failed", {
             workspaceID: workspace.id,
             status: response.status,
@@ -305,10 +361,12 @@ const layer = Layer.effect(
         return yield* body.pipe(
           Effect.map((result) => result as A),
           Effect.catch((error) =>
-            Effect.logWarning("workspace target response decode failed", {
-              workspaceID: workspace.id,
-              error: errorData(error),
-            }).pipe(Effect.as(input.fallback)),
+            input.strict
+              ? Effect.fail(error)
+              : Effect.logWarning("workspace target response decode failed", {
+                  workspaceID: workspace.id,
+                  error: errorData(error),
+                }).pipe(Effect.as(input.fallback)),
           ),
         )
       })
@@ -317,6 +375,8 @@ const layer = Layer.effect(
       space: Info,
       url: URL | string,
       headers: HeadersInit | undefined,
+      request: HistoryRequest = { scope: "workspace" },
+      replayOwnerID = space.id,
     ) {
       const sessionIDs = (yield* db
         .select({ id: SessionTable.id })
@@ -335,10 +395,20 @@ const layer = Layer.effect(
           )
         : {}
 
+      const payload: HistoryRequest =
+        request.scope === "workspace"
+          ? request
+          : {
+              ...request,
+              state: request.fence
+                ? { [request.fence.sessionID]: state[request.fence.sessionID] ?? -1 }
+                : request.state,
+            }
+
       const response = yield* http.execute(
         HttpClientRequest.post(route(url, "/sync/history"), {
           headers: new Headers(headers),
-          body: HttpBody.jsonUnsafe(state),
+          body: HttpBody.jsonUnsafe(payload),
         }),
       )
 
@@ -351,7 +421,16 @@ const layer = Layer.effect(
         })
       }
 
-      const history = (yield* response.json) as HistoryEvent[]
+      const raw = yield* response.json
+      const history = yield* Effect.try({
+        try: () => Schema.decodeUnknownSync(Schema.Array(RemoteHistoryEvent))(raw),
+        catch: (error) =>
+          new SyncHttpError({
+            message: `Workspace history response was invalid: ${errorData(error)}`,
+            status: 502,
+            body: JSON.stringify(raw),
+          }),
+      })
 
       yield* Effect.forEach(
         history,
@@ -365,11 +444,12 @@ const layer = Layer.effect(
                 type: event.type,
                 data: event.data,
               },
-              { publish: true, ownerID: space.id },
+              { publish: true, ownerID: replayOwnerID },
             )
-            .pipe(Effect.provideService(WorkspaceRef, space.id)),
+            .pipe(Effect.provideService(WorkspaceRef, replayOwnerID)),
         { discard: true },
       )
+      return history
     })
 
     const syncWorkspaceLoop = Effect.fn("Workspace.syncWorkspaceLoop")(function* (space: Info) {
@@ -435,6 +515,17 @@ const layer = Layer.effect(
                 })
               }
             }),
+          ).pipe(
+            // A mid-stream failure (reset connection, malformed chunk after a
+            // successful connect) must not kill the sync loop: fall through
+            // to the backoff reconnect below instead of terminating the
+            // workspace listener.
+            Effect.catch((error) =>
+              Effect.logWarning("workspace event stream failed", {
+                workspaceID: space.id,
+                error: errorData(error),
+              }),
+            ),
           )
 
           setStatus(space.id, "disconnected")
@@ -565,33 +656,16 @@ const layer = Layer.effect(
       return info
     })
 
-    const sessionWarp = Effect.fn("Workspace.sessionWarp")(function* (input: SessionWarpInput) {
-      return yield* Effect.gen(function* () {
-        const current = yield* db
-          .select({ workspaceID: SessionTable.workspace_id })
-          .from(SessionTable)
-          .where(eq(SessionTable.id, input.sessionID))
-          .get()
-          .pipe(Effect.orDie)
-
-        const destination = input.workspaceID ? yield* get(input.workspaceID) : undefined
-        if (input.workspaceID && !destination)
-          return yield* new WorkspaceNotFoundError({
-            message: `Workspace not found: ${input.workspaceID}`,
-            workspaceID: input.workspaceID,
-          })
-        const destinationTarget = destination ? yield* WorkspaceAdapterRuntime.target(destination) : undefined
-
-        if (destinationTarget?.type === "remote")
-          yield* Effect.gen(function* () {
-            if (current && !current.workspaceID) yield* session.touch(input.sessionID)
-            const latest = (yield* db
+    const readReplaySnapshot = Effect.fn("Workspace.readReplaySnapshot")(function* (sessionID: SessionID) {
+      const snapshot = yield* db
+        .transaction((tx) =>
+          Effect.gen(function* () {
+            const latest = (yield* tx
               .select({ seq: EventSequenceTable.seq })
               .from(EventSequenceTable)
-              .where(eq(EventSequenceTable.aggregate_id, input.sessionID))
-              .get()
-              .pipe(Effect.orDie))?.seq
-            const rows = yield* db
+              .where(eq(EventSequenceTable.aggregate_id, sessionID))
+              .get())?.seq
+            const rows = yield* tx
               .select({
                 id: EventTable.id,
                 aggregateID: EventTable.aggregate_id,
@@ -600,152 +674,406 @@ const layer = Layer.effect(
                 data: EventTable.data,
               })
               .from(EventTable)
-              .where(eq(EventTable.aggregate_id, input.sessionID))
+              .where(eq(EventTable.aggregate_id, sessionID))
               .orderBy(asc(EventTable.seq))
               .all()
-              .pipe(Effect.orDie)
-            if (latest === undefined || rows.length !== latest + 1 || rows.some((row, index) => row.seq !== index))
-              return yield* new SessionEventsNotReplayableError({
-                message: `Events are not fully replayable for session: ${input.sessionID}`,
-                sessionID: input.sessionID,
-              })
-          })
+            return { latest, rows }
+          }),
+        )
+        .pipe(Effect.orDie)
+      if (
+        snapshot.latest === undefined ||
+        snapshot.rows.length !== snapshot.latest + 1 ||
+        snapshot.rows.some((row, index) => row.seq !== index)
+      )
+        return yield* new SessionEventsNotReplayableError({
+          message: `Events are not fully replayable for session: ${sessionID}`,
+          sessionID,
+        })
+      return { seq: snapshot.latest, rows: snapshot.rows }
+    })
 
-        if (current?.workspaceID) {
-          const previous = yield* get(current.workspaceID)
-          if (previous) {
+    const sessionWarp = Effect.fn("Workspace.sessionWarp")(function* (input: SessionWarpInput) {
+      const current = yield* db
+        .select({ workspaceID: SessionTable.workspace_id, projectID: SessionTable.project_id })
+        .from(SessionTable)
+        .where(eq(SessionTable.id, input.sessionID))
+        .get()
+        .pipe(Effect.orDie)
+
+      const destination = input.workspaceID ? yield* get(input.workspaceID) : undefined
+      if (input.workspaceID && !destination)
+        return yield* new WorkspaceNotFoundError({
+          message: `Workspace not found: ${input.workspaceID}`,
+          workspaceID: input.workspaceID,
+        })
+      if (
+        input.projectID &&
+        (!current ||
+          current.projectID !== input.projectID ||
+          (destination !== undefined && destination.projectID !== input.projectID))
+      )
+        return yield* new SessionWarpAuthorizationError({
+          message: `Session ${input.sessionID} is not in the requested project`,
+          sessionID: input.sessionID,
+        })
+
+      const destinationTarget = destination ? yield* WorkspaceAdapterRuntime.target(destination) : undefined
+      const previous = current?.workspaceID ? yield* get(current.workspaceID) : undefined
+      if (input.projectID && previous && previous.projectID !== input.projectID)
+        return yield* new SessionWarpAuthorizationError({
+          message: `Source workspace for session ${input.sessionID} is not in the requested project`,
+          sessionID: input.sessionID,
+        })
+
+      const workspaceID = input.workspaceID
+      const finalOwner = workspaceID ?? current?.projectID ?? destination?.projectID
+      if (!finalOwner) return
+      const sourceOwner = previous?.id ?? current?.projectID ?? finalOwner
+      let sourceFenced = false
+      let destinationCommitted = false
+      let destinationOutcomeUnknown = false
+      let copyApplied = false
+      let sourcePatch = ""
+
+      const restoreSource = previous
+        ? Effect.gen(function* () {
             const target = yield* WorkspaceAdapterRuntime.target(previous)
+            if (target.type !== "remote") {
+              yield* events.claim(input.sessionID, previous.id)
+              return
+            }
+            // The source is fenced while this runs. A successful empty
+            // response proves that no source event landed during restoration.
+            const history = yield* syncHistory(
+              previous,
+              target.url,
+              target.headers,
+              { scope: "aggregate", state: {}, fence: { sessionID: input.sessionID, ownerID: previous.id } },
+              finalOwner,
+            )
+            if (history.length)
+              return yield* new SyncHttpError({
+                message: "Source changed while restoring warp ownership",
+                status: 409,
+                body: "",
+              })
+            yield* events.claim(input.sessionID, previous.id)
+          })
+        : events.claim(input.sessionID, sourceOwner)
 
-            if (target.type === "remote") {
-              yield* syncHistory(previous, target.url, target.headers).pipe(
-                Effect.catch((error) =>
-                  Effect.logWarning("session warp final source sync failed", {
-                    workspaceID: previous.id,
-                    sessionID: input.sessionID,
-                    error: errorData(error),
-                  }),
-                ),
+      const rollbackCopy = Effect.gen(function* () {
+        if (!copyApplied || !sourcePatch) return
+        const result = yield* runInWorkspace({
+          workspaceID: input.workspaceID ?? undefined,
+          local: () => vcs.apply({ patch: sourcePatch, reverse: true }),
+          remote: ({ target }) =>
+            HttpClientRequest.post(route(target.url, "/vcs/apply"), {
+              headers: new Headers(target.headers),
+              body: HttpBody.jsonUnsafe({ patch: sourcePatch, reverse: true }),
+            }),
+          fallback: { applied: false },
+          strict: true,
+        }).pipe(Effect.provide(AppNodeBuilderV1.build(InstanceStore.node)))
+        const applied = yield* Effect.try({
+          try: () => Schema.decodeUnknownSync(RemoteApplyResponse)(result),
+          catch: (error) =>
+            new SyncHttpError({
+              message: `Workspace rollback response was invalid: ${errorData(error)}`,
+              status: 502,
+              body: JSON.stringify(result),
+            }),
+        })
+        if (!applied.applied)
+          return yield* new Vcs.PatchApplyError({
+            message: "Workspace rollback was rejected",
+            reason: "not-clean",
+          })
+        copyApplied = false
+      })
+
+      const handoff = events.exclusive(
+        input.sessionID,
+        Effect.gen(function* () {
+          if (previous) {
+            const previousTarget = yield* WorkspaceAdapterRuntime.target(previous)
+            if (previousTarget.type === "remote") {
+              // Fence the local projection before asking the source to drain.
+              // Both sides then reject source writes while the snapshot is read.
+              yield* events.claim(input.sessionID, finalOwner)
+              yield* syncHistory(
+                previous,
+                previousTarget.url,
+                previousTarget.headers,
+                { scope: "aggregate", state: {}, fence: { sessionID: input.sessionID, ownerID: finalOwner } },
+                finalOwner,
               )
+              sourceFenced = true
             } else {
               yield* prompt.cancel(input.sessionID)
+              yield* events.claim(input.sessionID, previous.id)
+            }
+          }
+
+          if (destinationTarget?.type === "remote" && current && !current.workspaceID) yield* session.touch(input.sessionID)
+          const replaySnapshot = yield* readReplaySnapshot(input.sessionID)
+
+          if (input.copyChanges && current?.workspaceID) {
+            sourcePatch = yield* runInWorkspace({
+              workspaceID: current.workspaceID,
+              local: () => vcs.diffRaw(),
+              remote: ({ target }) =>
+                HttpClientRequest.get(route(target.url, "/vcs/diff/raw"), {
+                  headers: new Headers(target.headers),
+                }),
+              fallback: "",
+              response: "text",
+              strict: true,
+            }).pipe(Effect.provide(AppNodeBuilderV1.build(InstanceStore.node)))
+          }
+
+          if (sourcePatch) {
+            const result = yield* runInWorkspace({
+              workspaceID: input.workspaceID ?? undefined,
+              local: () => vcs.apply({ patch: sourcePatch }),
+              remote: ({ target }) =>
+                HttpClientRequest.post(route(target.url, "/vcs/apply"), {
+                  headers: new Headers(target.headers),
+                  body: HttpBody.jsonUnsafe({ patch: sourcePatch }),
+                }),
+              fallback: { applied: false },
+              strict: true,
+            }).pipe(Effect.provide(AppNodeBuilderV1.build(InstanceStore.node)))
+            const applied = yield* Effect.try({
+              try: () => Schema.decodeUnknownSync(RemoteApplyResponse)(result),
+              catch: (error) =>
+                new SyncHttpError({
+                  message: `Workspace apply response was invalid: ${errorData(error)}`,
+                  status: 502,
+                  body: JSON.stringify(result),
+                }),
+            })
+            if (!applied.applied)
+              return yield* new Vcs.PatchApplyError({
+                message: "Workspace target rejected the patch",
+                reason: "not-clean",
+              })
+            copyApplied = true
+          }
+
+          if (workspaceID === null) {
+            yield* session.setWorkspace({ sessionID: input.sessionID, workspaceID: undefined })
+            yield* events.claim(input.sessionID, current?.projectID ?? finalOwner)
+            return
+          }
+
+          const space = destination!
+          const target = destinationTarget!
+          if (target.type === "local") {
+            yield* session
+              .setWorkspace({ sessionID: input.sessionID, workspaceID })
+              .pipe(Effect.provideService(WorkspaceRef, workspaceID))
+            yield* events.claim(input.sessionID, workspaceID)
+            return
+          }
+
+          const warpID = EventV2.ID.create()
+          const rows = replaySnapshot.rows
+          const response = yield* http.execute(
+            HttpClientRequest.post(route(target.url, "/sync/replay"), {
+              headers: new Headers(target.headers),
+              body: HttpBody.jsonUnsafe({ directory: space.directory ?? "", events: rows, warpID, ownerID: finalOwner }),
+            }),
+          )
+          if (response.status < 200 || response.status >= 300) {
+            const body = yield* response.text
+            return yield* new SessionWarpHttpError({
+              message: `Failed to warp session ${input.sessionID} into workspace ${workspaceID}: HTTP ${response.status} ${body}`,
+              workspaceID,
+              sessionID: input.sessionID,
+              status: response.status,
+              body,
+            })
+          }
+          const replayRaw = yield* response.json
+          const replayResult = yield* Effect.try({
+            try: () => Schema.decodeUnknownSync(RemoteReplayResponse)(replayRaw),
+            catch: (error) =>
+              new SessionWarpHttpError({
+                message: `Workspace replay response was invalid: ${errorData(error)}`,
+                workspaceID,
+                sessionID: input.sessionID,
+                status: 502,
+                body: JSON.stringify(replayRaw),
+              }),
+          })
+          if (replayResult.sessionID !== input.sessionID)
+            return yield* new SessionWarpHttpError({
+              message: "Workspace replay response named the wrong session",
+              workspaceID,
+              sessionID: input.sessionID,
+              status: 502,
+              body: JSON.stringify(replayRaw),
+            })
+
+          yield* events.claim(input.sessionID, workspaceID)
+          const stealResult = yield* Effect.gen(function* () {
+            const response = yield* http
+              .execute(
+                HttpClientRequest.post(route(target.url, "/sync/steal"), {
+                  headers: new Headers(target.headers),
+                  body: HttpBody.jsonUnsafe({ sessionID: input.sessionID, seq: replaySnapshot.seq, warpID, ownerID: finalOwner }),
+                }),
+              )
+              .pipe(
+                Effect.flatMap((response) =>
+                  Effect.gen(function* () {
+                    if (response.status < 200 || response.status >= 300)
+                      return {
+                        _tag: "http-error" as const,
+                        status: response.status,
+                        body: yield* response.text,
+                      }
+                    const raw = yield* response.json
+                    const body = yield* Effect.try({
+                      try: () => Schema.decodeUnknownSync(RemoteStealResponse)(raw),
+                      catch: (error) =>
+                        new SessionWarpHttpError({
+                          message: `Workspace steal response was invalid: ${errorData(error)}`,
+                          workspaceID,
+                          sessionID: input.sessionID,
+                          status: 502,
+                          body: JSON.stringify(raw),
+                        }),
+                    })
+                    if (
+                      body.sessionID !== input.sessionID ||
+                      !isCommittedSessionWarp(
+                        {
+                          aggregate_id: body.event.aggregateID,
+                          seq: body.event.seq,
+                          type: body.event.type,
+                          data: body.event.data,
+                        },
+                        {
+                          sessionID: input.sessionID,
+                          seq: replaySnapshot.seq,
+                          workspaceID,
+                        },
+                      )
+                    ) {
+                      return yield* new SessionWarpHttpError({
+                        message: "Workspace steal response did not commit the requested warp",
+                        workspaceID,
+                        sessionID: input.sessionID,
+                        status: 502,
+                        body: JSON.stringify(raw),
+                      })
+                    }
+                    return { _tag: "success" as const, event: body.event }
+                  }),
+                ),
+                Effect.retry(Schedule.spaced("50 millis")),
+                Effect.interruptible,
+                Effect.timeoutOption("10 seconds"),
+              )
+            if (response._tag === "Some") {
+              if (response.value._tag === "http-error")
+                return yield* new SessionWarpHttpError({
+                  message: `Failed to steal session ${input.sessionID} into workspace ${workspaceID}: HTTP ${response.value.status} ${response.value.body}`,
+                  workspaceID,
+                  sessionID: input.sessionID,
+                  status: response.value.status,
+                  body: response.value.body,
+                })
+              destinationCommitted = true
+              return response.value.event
             }
 
-            // "claim" this session so any future events coming from
-            // the old workspace are ignored
-            yield* events.claim(input.sessionID, input.workspaceID ?? previous.projectID)
-          }
-        }
-
-        const sourcePatch =
-          input.copyChanges && current?.workspaceID
-            ? yield* runInWorkspace({
-                workspaceID: current?.workspaceID ?? undefined,
-                local: () => vcs.diffRaw(),
-                remote: ({ target }) =>
-                  HttpClientRequest.get(route(target.url, "/vcs/diff/raw"), {
-                    headers: new Headers(target.headers),
-                  }),
-                fallback: "",
-                response: "text",
-              }).pipe(Effect.provide(AppNodeBuilderV1.build(InstanceStore.node)))
-            : ""
-
-        if (sourcePatch) {
-          // Attempt to apply the file changes to the new workspace.
-          // We intentionally do first so if it fails we don't warp
-          // the session.
-          yield* runInWorkspace({
-            workspaceID: input.workspaceID ?? undefined,
-            local: () => vcs.apply({ patch: sourcePatch }),
-            remote: ({ target }) =>
-              HttpClientRequest.post(route(target.url, "/vcs/apply"), {
-                headers: new Headers(target.headers),
-                body: HttpBody.jsonUnsafe({ patch: sourcePatch }),
-              }),
-            fallback: { applied: false },
-          }).pipe(Effect.provide(AppNodeBuilderV1.build(InstanceStore.node)))
-        }
-
-        if (input.workspaceID === null) {
-          yield* session.setWorkspace({ sessionID: input.sessionID, workspaceID: undefined })
-
-          return
-        }
-
-        const workspaceID = input.workspaceID
-        const space = destination!
-        const target = destinationTarget!
-
-        if (target.type === "local") {
-          yield* session.setWorkspace({ sessionID: input.sessionID, workspaceID: input.workspaceID })
-
-          return
-        }
-
-        const rows = yield* db
-          .select({
-            id: EventTable.id,
-            aggregateID: EventTable.aggregate_id,
-            seq: EventTable.seq,
-            type: EventTable.type,
-            data: EventTable.data,
-          })
-          .from(EventTable)
-          .where(eq(EventTable.aggregate_id, input.sessionID))
-          .orderBy(asc(EventTable.seq))
-          .all()
-          .pipe(Effect.orDie)
-
-        const batches = Iterable.chunksOf(rows, 10)
-        const total = Iterable.size(batches)
-
-        yield* Effect.forEach(
-          batches,
-          (events, i) =>
-            Effect.gen(function* () {
-              const response = yield* http.execute(
-                HttpClientRequest.post(route(target.url, "/sync/replay"), {
+            const reconciliation = yield* http
+              .execute(
+                HttpClientRequest.post(route(target.url, "/sync/history"), {
                   headers: new Headers(target.headers),
                   body: HttpBody.jsonUnsafe({
-                    directory: space.directory ?? "",
-                    events,
+                    scope: "aggregate",
+                    state: { [input.sessionID]: replaySnapshot.seq },
                   }),
                 }),
               )
-
-              if (response.status < 200 || response.status >= 300) {
-                const body = yield* response.text
+              .pipe(
+                Effect.flatMap((response) =>
+                  Effect.gen(function* () {
+                    if (response.status < 200 || response.status >= 300) return
+                    const raw = yield* response.json
+                    return yield* Effect.try({
+                      try: () => Schema.decodeUnknownSync(Schema.Array(RemoteHistoryEvent))(raw),
+                      catch: () => undefined,
+                    })
+                  }),
+                ),
+                Effect.timeoutOption("2 seconds"),
+                Effect.catch(() => Effect.succeed(undefined)),
+              )
+            if (reconciliation?._tag === "Some" && reconciliation.value) {
+              const sessionEvents = reconciliation.value.filter(
+                (item) => item.aggregate_id === input.sessionID && item.seq > replaySnapshot.seq,
+              )
+              const terminal = sessionEvents.toSorted((a, b) => b.seq - a.seq)[0]
+              if (
+                terminal &&
+                terminal.seq === replaySnapshot.seq + 1 &&
+                isCommittedSessionWarp(terminal, {
+                  sessionID: input.sessionID,
+                  seq: replaySnapshot.seq,
+                  workspaceID,
+                })
+              ) {
+                destinationCommitted = true
+                return {
+                  id: EventV2.ID.make(terminal.id),
+                  aggregateID: terminal.aggregate_id,
+                  seq: terminal.seq,
+                  type: terminal.type,
+                  data: terminal.data,
+                }
+              }
+              if (sessionEvents.length === 0)
                 return yield* new SessionWarpHttpError({
-                  message: `Failed to warp session ${input.sessionID} into workspace ${workspaceID}: HTTP ${response.status} ${body}`,
+                  message: `Steal did not commit session ${input.sessionID}`,
                   workspaceID,
                   sessionID: input.sessionID,
-                  status: response.status,
-                  body,
+                  status: 409,
+                  body: "",
                 })
-              }
-            }),
-          { discard: true },
-        )
-
-        const response = yield* http.execute(
-          HttpClientRequest.post(route(target.url, "/sync/steal"), {
-            headers: new Headers(target.headers),
-            body: HttpBody.jsonUnsafe({ sessionID: input.sessionID }),
-          }),
-        )
-        if (response.status < 200 || response.status >= 300) {
-          const body = yield* response.text
-          return yield* new SessionWarpHttpError({
-            message: `Failed to steal session ${input.sessionID} into workspace ${workspaceID}: HTTP ${response.status} ${body}`,
-            workspaceID,
-            sessionID: input.sessionID,
-            status: response.status,
-            body,
+            }
+            destinationOutcomeUnknown = true
+            return yield* new SessionWarpHttpError({
+              message: `Timed out stealing session ${input.sessionID} into workspace ${workspaceID}`,
+              workspaceID,
+              sessionID: input.sessionID,
+              status: 504,
+              body: "",
+            })
           })
-        }
+          yield* events.replay(stealResult, { publish: true, ownerID: workspaceID, strictOwner: true })
+        }),
+      )
 
-        yield* session.setWorkspace({ sessionID: input.sessionID, workspaceID: input.workspaceID })
-      })
+      const exit = yield* Effect.uninterruptibleMask((restore) => restore(handoff).pipe(Effect.exit))
+      if (Exit.isSuccess(exit)) return exit.value
+      if (!destinationCommitted && !destinationOutcomeUnknown) {
+        const cleanup = yield* Effect.exit(
+          Effect.uninterruptible(
+            Effect.gen(function* () {
+              yield* rollbackCopy
+              if (sourceFenced) yield* restoreSource
+              else yield* events.claim(input.sessionID, sourceOwner)
+            }),
+          ),
+        )
+        if (Exit.isFailure(cleanup)) return yield* Effect.failCause(cleanup.cause)
+      }
+      return yield* Effect.failCause(exit.cause)
     })
 
     const list = Effect.fn("Workspace.list")(function* (project: Project.Info) {
@@ -939,18 +1267,37 @@ function waitUntilSynced(input: {
   signal?: AbortSignal
   timeout: number
 }): Effect.Effect<void, unknown> {
-  return Effect.suspend(() =>
-    waitEvent({
-      timeout: input.timeout,
-      signal: input.signal,
-      fn(event) {
-        return event.workspace === input.workspaceID || event.payload.type === "sync"
-      },
-    }).pipe(
-      Effect.andThen(synced(input.db, input.state)),
-      Effect.flatMap((done): Effect.Effect<void, unknown> => (done ? Effect.void : waitUntilSynced(input))),
-    ),
-  )
+  // One absolute deadline for the whole wait: matching events may re-check
+  // the fence as often as they arrive, but they never extend the deadline.
+  const deadline = Date.now() + input.timeout
+
+  const poll = (): Effect.Effect<void, unknown> =>
+    Effect.suspend(() =>
+      waitEvent({
+        timeout: Math.max(0, deadline - Date.now()),
+        signal: input.signal,
+        fn(event) {
+          // Only events from the target workspace release the fence early.
+          // Sync events from other workspaces must not reset the timer.
+          return event.workspace === input.workspaceID
+        },
+      }).pipe(
+        Effect.andThen(synced(input.db, input.state)),
+        Effect.flatMap((done): Effect.Effect<void, unknown> => (done ? Effect.void : poll())),
+        Effect.catch(() =>
+          // The wait failed (deadline reached or aborted). Re-check once so a
+          // fence that completed without a matching event still succeeds,
+          // then surface the failure to the caller's error mapping.
+          synced(input.db, input.state).pipe(
+            Effect.flatMap((done): Effect.Effect<void, unknown> =>
+              done ? Effect.void : Effect.fail(new Error("Timed out waiting for sync fence")),
+            ),
+          ),
+        ),
+      ),
+    )
+
+  return poll()
 }
 
 function synced(db: Database.Interface["db"], state: Record<string, number>): Effect.Effect<boolean> {

@@ -10,10 +10,11 @@ import path from "path"
 import { createClient } from "@hey-api/openapi-ts"
 
 const opencode = path.resolve(dir, "../../opencode")
+const openapi = path.resolve(dir, "../openapi.json")
 
-await $`bun dev generate > ${dir}/openapi.json`.cwd(opencode)
+await $`bun dev generate > ${openapi}`.cwd(opencode)
 
-const document = (await Bun.file("./openapi.json").json()) as {
+const document = (await Bun.file(openapi).json()) as {
   components?: { schemas?: Record<string, unknown> }
   [key: string]: unknown
 }
@@ -41,11 +42,11 @@ if (schemas) {
   for (const name of Object.keys(schemas)) {
     if (/^SessionNext\w+1$/.test(name) && !reachable.has(name)) delete schemas[name]
   }
-  await Bun.write("./openapi.json", JSON.stringify(document))
+  await Bun.write(openapi, JSON.stringify(document, null, 2) + "\n")
 }
 
 await createClient({
-  input: "./openapi.json",
+  input: openapi,
   output: {
     path: "./src/v2/gen",
     tsConfigPath: path.join(dir, "tsconfig.json"),
@@ -92,7 +93,14 @@ const historySdkPatched = generatedSdk.replace(
 if (historySdkPatched === generatedSdk) {
   throw new Error("Session history numeric SDK patch did not apply")
 }
-await Bun.write("./src/v2/gen/sdk.gen.ts", historySdkPatched)
+const syncStealSdkPatched = historySdkPatched.replace(
+  /(Steal session into workspace[\s\S]*?parameters)\?: \{([\s\S]*?sessionID)\?: string([;,]\s*seq)\?: number([;,]\s*warpID)\?: string/,
+  "$1: {$2: string$3: number$4: string",
+)
+if (syncStealSdkPatched === historySdkPatched) {
+  throw new Error("Sync steal required parameter SDK patch did not apply")
+}
+await Bun.write("./src/v2/gen/sdk.gen.ts", syncStealSdkPatched)
 
 // Patch a @hey-api/openapi-ts codegen bug: SseFn incorrectly passes the
 // endpoint's TError into the second generic of ServerSentEventsResult, which
@@ -116,4 +124,3 @@ await $`bun prettier --write src/gen`
 await $`bun prettier --write src/v2`
 await $`rm -rf dist`
 await $`bun tsc`
-await $`rm openapi.json`

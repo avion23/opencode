@@ -10,6 +10,7 @@ import type { ProviderMetadata, Usage } from "@opencode-ai/llm"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { EventV2 } from "@opencode-ai/core/event"
 import { SessionV2 } from "@opencode-ai/core/session"
 import * as SessionExecutionLocal from "@opencode-ai/core/session/execution/local"
 import { locationServiceMapLayer } from "@opencode-ai/core/location-services"
@@ -443,7 +444,12 @@ export interface Interface {
   readonly clearRevert: (sessionID: SessionID) => Effect.Effect<void>
   readonly setSummary: (input: { sessionID: SessionID; summary: Info["summary"] }) => Effect.Effect<void>
   readonly setShare: (input: { sessionID: SessionID; share: Info["share"] }) => Effect.Effect<void>
-  readonly setWorkspace: (input: { sessionID: SessionID; workspaceID: Info["workspaceID"] }) => Effect.Effect<void>
+  readonly setWorkspace: (input: {
+    sessionID: SessionID
+    workspaceID: Info["workspaceID"]
+    eventID?: EventV2.ID
+    ownerID?: string
+  }) => Effect.Effect<void>
   readonly diff: (sessionID: SessionID) => Effect.Effect<Snapshot.FileDiff[]>
   readonly messages: (input: { sessionID: SessionID; limit?: number }) => Effect.Effect<SessionV1.WithParts[], NotFound>
   readonly children: (parentID: SessionID) => Effect.Effect<Info[]>
@@ -619,7 +625,11 @@ const layer: Layer.Layer<
           yield* remove(child.id)
         }
 
-        yield* events.publish(SessionV1.Event.Deleted, { sessionID, info: session })
+        yield* events.publish(
+          SessionV1.Event.Deleted,
+          { sessionID, info: session },
+          { ownerID: session.workspaceID, strictOwner: true },
+        )
         yield* events.remove(sessionID)
       } catch (error) {
         yield* Effect.logError("failed to remove session", { sessionID, error })
@@ -628,17 +638,27 @@ const layer: Layer.Layer<
 
     const updateMessage = <T extends SessionV1.Info>(msg: T): Effect.Effect<T> =>
       Effect.gen(function* () {
-        yield* events.publish(SessionV1.Event.MessageUpdated, { sessionID: msg.sessionID, info: msg })
+        const current = yield* get(msg.sessionID).pipe(Effect.orDie)
+        yield* events.publish(
+          SessionV1.Event.MessageUpdated,
+          { sessionID: msg.sessionID, info: msg },
+          { ownerID: current.workspaceID, strictOwner: true },
+        )
         return msg
       }).pipe(Effect.withSpan("Session.updateMessage"))
 
     const updatePart = <T extends SessionV1.Part>(part: T): Effect.Effect<T> =>
       Effect.gen(function* () {
-        yield* events.publish(SessionV1.Event.PartUpdated, {
-          sessionID: part.sessionID,
-          part: structuredClone(part),
-          time: Date.now(),
-        })
+        const current = yield* get(part.sessionID).pipe(Effect.orDie)
+        yield* events.publish(
+          SessionV1.Event.PartUpdated,
+          {
+            sessionID: part.sessionID,
+            part: structuredClone(part),
+            time: Date.now(),
+          },
+          { ownerID: current.workspaceID, strictOwner: true },
+        )
         return part
       }).pipe(Effect.withSpan("Session.updatePart"))
 
@@ -731,7 +751,7 @@ const layer: Layer.Layer<
       return session
     })
 
-    const patch = (sessionID: SessionID, info: Patch) =>
+    const patch = (sessionID: SessionID, info: Patch, eventID?: EventV2.ID) =>
       Effect.gen(function* () {
         const current = yield* get(sessionID)
         const next = {
@@ -743,7 +763,15 @@ const layer: Layer.Layer<
           revert: info.revert === null ? undefined : (info.revert ?? current.revert),
           permission: info.permission === null ? undefined : (info.permission ?? current.permission),
         } as Info
-        yield* events.publish(SessionV1.Event.Updated, { sessionID, info: next })
+        yield* events.publish(
+          SessionV1.Event.Updated,
+          { sessionID, info: next },
+          {
+            id: eventID,
+            ownerID: current.workspaceID,
+            strictOwner: true,
+          },
+        )
       })
 
     const touch = Effect.fn("Session.touch")(function* (sessionID: SessionID) {
@@ -814,10 +842,20 @@ const layer: Layer.Layer<
     const setWorkspace = Effect.fn("Session.setWorkspace")(function* (input: {
       sessionID: SessionID
       workspaceID: Info["workspaceID"]
+      eventID?: EventV2.ID
+      ownerID?: string
     }) {
-      yield* patch(input.sessionID, { workspaceID: input.workspaceID, time: { updated: Date.now() } }).pipe(
-        Effect.orDie,
-      )
+      const current = yield* get(input.sessionID).pipe(Effect.orDie)
+      yield* events
+        .publish(
+          SessionV1.Event.Updated,
+          {
+            sessionID: input.sessionID,
+            info: { ...current, workspaceID: input.workspaceID, time: { ...current.time, updated: Date.now() } },
+          },
+          { id: input.eventID, ownerID: input.ownerID ?? current.workspaceID, strictOwner: true },
+        )
+        .pipe(Effect.orDie)
     })
 
     const diff = Effect.fn("Session.diff")(function* (sessionID: SessionID) {
@@ -854,10 +892,15 @@ const layer: Layer.Layer<
       sessionID: SessionID
       messageID: MessageID
     }) {
-      yield* events.publish(SessionV1.Event.MessageRemoved, {
-        sessionID: input.sessionID,
-        messageID: input.messageID,
-      })
+      const current = yield* get(input.sessionID).pipe(Effect.orDie)
+      yield* events.publish(
+        SessionV1.Event.MessageRemoved,
+        {
+          sessionID: input.sessionID,
+          messageID: input.messageID,
+        },
+        { ownerID: current.workspaceID, strictOwner: true },
+      )
       return input.messageID
     })
 
@@ -866,11 +909,16 @@ const layer: Layer.Layer<
       messageID: MessageID
       partID: PartID
     }) {
-      yield* events.publish(SessionV1.Event.PartRemoved, {
-        sessionID: input.sessionID,
-        messageID: input.messageID,
-        partID: input.partID,
-      })
+      const current = yield* get(input.sessionID).pipe(Effect.orDie)
+      yield* events.publish(
+        SessionV1.Event.PartRemoved,
+        {
+          sessionID: input.sessionID,
+          messageID: input.messageID,
+          partID: input.partID,
+        },
+        { ownerID: current.workspaceID, strictOwner: true },
+      )
       return input.partID
     })
 

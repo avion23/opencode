@@ -87,7 +87,7 @@ export interface Interface {
   readonly patchAll: (cwd: string, ref: string, options?: PatchOptions) => Effect.Effect<Patch>
   readonly patchUntracked: (cwd: string, file: string, options?: PatchOptions) => Effect.Effect<Patch>
   readonly statUntracked: (cwd: string, file: string) => Effect.Effect<Stat | undefined>
-  readonly applyPatch: (cwd: string, patch: string) => Effect.Effect<Result>
+  readonly applyPatch: (cwd: string, patch: string, reverse?: boolean) => Effect.Effect<Result>
 }
 
 const kind = (code: string): Kind => {
@@ -319,8 +319,8 @@ const layer = Layer.effect(
       } satisfies Stat
     })
 
-    const applyPatch = Effect.fn("Git.applyPatch")(function* (cwd: string, patch: string) {
-      return yield* run(["apply", "-"], { cwd, stdin: stdin(patch) })
+    const applyPatch = Effect.fn("Git.applyPatch")(function* (cwd: string, patch: string, reverse = false) {
+      return yield* run(["apply", ...(reverse ? ["--reverse"] : []), "-"], { cwd, stdin: stdin(patch) })
     })
 
     return Service.of({

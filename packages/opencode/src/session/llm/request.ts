@@ -33,7 +33,10 @@ type PrepareInput = {
   readonly plugin: Plugin.Interface
   readonly flags: RuntimeFlags.Info
   readonly isWorkflow: boolean
+  readonly preparedSystem?: string[]
 }
+
+type SystemPrepareInput = Pick<PrepareInput, "user" | "sessionID" | "model" | "agent" | "system" | "plugin">
 
 export type Prepared = {
   readonly system: string[]
@@ -53,8 +56,7 @@ export type Prepared = {
 const mergeOptions = (target: Record<string, any>, source: Record<string, any> | undefined): Record<string, any> =>
   mergeDeep(target, source ?? {}) as Record<string, any>
 
-export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: PrepareInput) {
-  const isOpenaiOauth = input.provider.id === "openai" && input.auth?.type === "oauth"
+export const prepareSystem = Effect.fn("LLMRequestPrep.prepareSystem")(function* (input: SystemPrepareInput) {
   const system = [
     [
       ...(input.agent.prompt ? [input.agent.prompt] : SystemPrompt.provider(input.model)),
@@ -76,6 +78,12 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     system.length = 0
     system.push(header, rest.join("\n"))
   }
+  return system
+})
+
+export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: PrepareInput) {
+  const isOpenaiOauth = input.provider.id === "openai" && input.auth?.type === "oauth"
+  const system = input.preparedSystem ?? (yield* prepareSystem(input))
 
   const variant =
     !input.small && input.model.variants && input.user.model.variant

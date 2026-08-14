@@ -4,8 +4,8 @@ import fs from "node:fs/promises"
 import Http from "node:http"
 import path from "node:path"
 import { NodeHttpServer } from "@effect/platform-node"
-import { Effect, Exit, Fiber, Layer, Schema } from "effect"
-import { HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
+import { Context, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
+import { HttpClient, HttpClientResponse, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { eq } from "drizzle-orm"
 import { GlobalBus, type GlobalEvent } from "@/bus/global"
 import { Project } from "@/project/project"
@@ -14,7 +14,7 @@ import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { Session as SessionNs } from "@/session/session"
-import { SessionID } from "@/session/schema"
+import { MessageID, PartID, SessionID } from "@/session/schema"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
@@ -32,6 +32,12 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { EventV2 } from "@opencode-ai/core/event"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { Flag } from "@opencode-ai/core/flag/flag"
+import { HttpApiApp } from "@/server/routes/instance/httpapi/server"
 
 const originalEnv = {
   OPENCODE_AUTH_CONTENT: process.env.OPENCODE_AUTH_CONTENT,
@@ -41,7 +47,7 @@ const originalEnv = {
   OTEL_RESOURCE_ATTRIBUTES: process.env.OTEL_RESOURCE_ATTRIBUTES,
 }
 
-const workspaceLayer = (experimentalWorkspaces: boolean) =>
+const workspaceLayer = (experimentalWorkspaces: boolean, client?: HttpClient.HttpClient) =>
   AppNodeBuilder.build(
     LayerNode.group([
       Workspace.node,
@@ -50,6 +56,7 @@ const workspaceLayer = (experimentalWorkspaces: boolean) =>
       Database.node,
       InstanceStore.node,
       Ripgrep.node,
+      EventV2.node,
     ]),
     [
       [RuntimeFlags.node, RuntimeFlags.layer({ experimentalWorkspaces })],
@@ -57,6 +64,7 @@ const workspaceLayer = (experimentalWorkspaces: boolean) =>
         InstanceStore.bootstrapNode,
         Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void })),
       ],
+      ...(client ? ([[httpClient, Layer.succeed(HttpClient.HttpClient, client)]] as const) : []),
     ],
   )
 
@@ -65,6 +73,27 @@ const testServerLayer = Layer.mergeAll(
   workspaceLayer(true),
 )
 const it = testEffect(testServerLayer)
+const timeoutIt = testEffect(
+  Layer.mergeAll(
+    workspaceLayer(
+      true,
+      HttpClient.make((request) => {
+        if (new URL(request.url).pathname === "/warp-target/sync/steal") return Effect.never
+        if (new URL(request.url).pathname === "/warp-target/sync/history")
+          return Effect.succeed(
+            HttpClientResponse.fromWeb(request, Response.json({ error: "unavailable" }, { status: 503 })),
+          )
+        return Effect.succeed(
+          HttpClientResponse.fromWeb(
+            request,
+            Response.json(new URL(request.url).pathname === "/warp-source/sync/history" ? [] : { sessionID: "ok" }),
+          ),
+        )
+      }),
+    ),
+    AppNodeBuilder.build(CrossSpawnSpawner.node),
+  ),
+)
 
 type RecordedCreate = {
   info: WorkspaceInfo
@@ -262,6 +291,19 @@ function eventStreamResponse(events: unknown[] = [], keepOpen = true) {
   )
 }
 
+function brokenEventStreamResponse(event: unknown) {
+  const encoder = new TextEncoder()
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`))
+        controller.error(new Error("event stream failed mid-flight"))
+      },
+    }),
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  )
+}
+
 function serverUrl() {
   return Effect.gen(function* () {
     return HttpServer.formatAddress((yield* HttpServer.HttpServer).address)
@@ -355,6 +397,27 @@ function sessionSequenceOwner(sessionID: SessionID) {
         Effect.map((row) => row?.ownerID),
       ),
   )
+}
+
+function stealResponse(call: FetchCall, info: SessionNs.Info, workspaceID: WorkspaceV2.ID) {
+  const payload = call.json as { sessionID: SessionID; seq: number; warpID: string }
+  return HttpServerResponse.json({
+    sessionID: payload.sessionID,
+    event: {
+      id: payload.warpID,
+      aggregateID: payload.sessionID,
+      seq: payload.seq + 1,
+      type: "session.updated.1",
+      data: {
+        sessionID: payload.sessionID,
+        info: {
+          ...info,
+          workspaceID,
+          time: { ...info.time, updated: Date.now() },
+        },
+      },
+    },
+  })
 }
 
 describe("workspace schemas and exports", () => {
@@ -994,6 +1057,7 @@ describe("workspace CRUD", () => {
     let historySessionID: SessionID | undefined
     let historySession: SessionNs.Info | undefined
     let historyNextSeq = 0
+    let destinationWorkspaceID: WorkspaceV2.ID | undefined
     return Effect.gen(function* () {
       yield* HttpServer.serveEffect()(
         Effect.gen(function* () {
@@ -1020,9 +1084,9 @@ describe("workspace CRUD", () => {
           }
           if (call.url.pathname === "/warp-source/vcs/diff/raw") return HttpServerResponse.text("remote patch")
           if (call.url.pathname === "/warp-target/sync/replay")
-            return yield* HttpServerResponse.json({ sessionID: "ok" })
+            return yield* HttpServerResponse.json({ sessionID: (call.json as { events: Array<{ aggregateID: string }> }).events[0]!.aggregateID })
           if (call.url.pathname === "/warp-target/sync/steal")
-            return yield* HttpServerResponse.json({ sessionID: "ok" })
+            return yield* stealResponse(call, historySession!, destinationWorkspaceID!)
           if (call.url.pathname === "/warp-target/vcs/apply") return yield* HttpServerResponse.json({ applied: true })
           return HttpServerResponse.text("unexpected", { status: 500 })
         }),
@@ -1038,6 +1102,7 @@ describe("workspace CRUD", () => {
             const targetType = unique("warp-remote-target")
             const previous = workspaceInfo(instance.project.id, previousType)
             const target = workspaceInfo(instance.project.id, targetType, { directory: "remote-target-dir" })
+            destinationWorkspaceID = target.id
             yield* insertWorkspace(previous)
             yield* insertWorkspace(target)
             registerAdapter(instance.project.id, previousType, remoteAdapter(`${url}/warp-source`).adapter)
@@ -1074,7 +1139,7 @@ describe("workspace CRUD", () => {
                 },
               ],
             })
-            expect(calls[4].json).toEqual({ sessionID: session.id })
+            expect(calls[4].json).toMatchObject({ sessionID: session.id, seq: historyNextSeq })
             expect((yield* sessionSvc.get(session.id)).title).toBe("from source history")
             expect(yield* sessionSequenceOwner(session.id)).toBe(target.id)
           }),
@@ -1082,6 +1147,619 @@ describe("workspace CRUD", () => {
       )
     })
   })
+
+  it.live("sessionWarp aborts when a durable event lands after the replay snapshot", () => {
+    const calls: FetchCall[] = []
+    let historySessionID: SessionID | undefined
+    let historySession: SessionNs.Info | undefined
+    let historyNextSeq = 0
+    let injected = false
+    return Effect.gen(function* () {
+      yield* HttpServer.serveEffect()(
+        Effect.gen(function* () {
+          const req = yield* HttpServerRequest.HttpServerRequest
+          const bodyText = yield* req.text
+          const call = {
+            url: new URL(req.url, "http://localhost"),
+            method: req.method,
+            headers: new Headers(req.headers),
+            bodyText,
+            json: bodyText ? JSON.parse(bodyText) : undefined,
+          }
+          calls.push(call)
+          if (call.url.pathname === "/warp-source/sync/history") {
+            return yield* HttpServerResponse.json([
+              {
+                id: `evt_${unique("warp-source-history")}`,
+                aggregate_id: historySessionID!,
+                seq: historyNextSeq,
+                type: "session.updated.1",
+                data: { sessionID: historySessionID!, info: historySession! },
+              },
+            ])
+          }
+          if (call.url.pathname === "/warp-target/sync/replay") {
+            if (!injected && historySessionID) {
+              injected = true
+              const session = yield* SessionNs.Service
+              yield* session.setTitle({ sessionID: historySessionID, title: "concurrent update" })
+            }
+            return yield* HttpServerResponse.json({ sessionID: (call.json as { events: Array<{ aggregateID: string }> }).events[0]!.aggregateID })
+          }
+          if (call.url.pathname === "/warp-target/sync/steal")
+            return yield* HttpServerResponse.json({ sessionID: (call.json as { sessionID: string }).sessionID })
+          return HttpServerResponse.text("unexpected", { status: 500 })
+        }),
+      )
+      const url = yield* serverUrl()
+      yield* provideTmpdirInstance(
+        () =>
+          Effect.gen(function* () {
+            const workspace = yield* Workspace.Service
+            const sessionSvc = yield* SessionNs.Service
+            const instance = yield* requireInstance
+            const previousType = unique("warp-conflict-source")
+            const targetType = unique("warp-conflict-target")
+            const previous = workspaceInfo(instance.project.id, previousType)
+            const target = workspaceInfo(instance.project.id, targetType, { directory: "remote-target-dir" })
+            yield* insertWorkspace(previous)
+            yield* insertWorkspace(target)
+            registerAdapter(instance.project.id, previousType, remoteAdapter(`${url}/warp-source`).adapter)
+            registerAdapter(instance.project.id, targetType, remoteAdapter(`${url}/warp-target`).adapter)
+            const session = yield* sessionSvc.create({})
+            yield* attachSessionToWorkspace(session.id, previous.id)
+            historySessionID = session.id
+            historySession = { ...session, workspaceID: previous.id, title: "from source history" }
+            historyNextSeq = ((yield* sessionSequence(session.id)) ?? -1) + 1
+
+            const error = yield* Effect.flip(workspace.sessionWarp({ workspaceID: target.id, sessionID: session.id }))
+
+            expect(error).toMatchObject({
+              _tag: "WorkspaceSessionWarpConflictError",
+              sessionID: session.id,
+            })
+            expect((yield* sessionSvc.get(session.id)).workspaceID).toBe(previous.id)
+            expect(yield* sessionSequenceOwner(session.id)).toBe(previous.id)
+            expect(calls.map((call) => `${call.method} ${call.url.pathname}`)).toEqual([
+              "POST /warp-source/sync/history",
+              "POST /warp-target/sync/replay",
+            ])
+            expect(calls[1].json).toMatchObject({
+              events: [{ seq: 0 }, { seq: historyNextSeq }],
+            })
+          }),
+        { git: true },
+      )
+    })
+  })
+
+  it.live("sessionWarp holds source event commits until destination steal completes", () => {
+    const calls: FetchCall[] = []
+    let sessionInfo: SessionNs.Info | undefined
+    let destinationWorkspaceID: WorkspaceV2.ID | undefined
+    return Effect.gen(function* () {
+      const stealStarted = yield* Deferred.make<void>()
+      const releaseSteal = yield* Deferred.make<void>()
+      const eventStarted = yield* Deferred.make<void>()
+      const eventDone = yield* Deferred.make<void>()
+      const partStarted = yield* Deferred.make<void>()
+      const partDone = yield* Deferred.make<void>()
+      yield* HttpServer.serveEffect()(
+        Effect.gen(function* () {
+          const req = yield* HttpServerRequest.HttpServerRequest
+          const bodyText = yield* req.text
+          const call = {
+            url: new URL(req.url, "http://localhost"),
+            method: req.method,
+            headers: new Headers(req.headers),
+            bodyText,
+            json: bodyText ? JSON.parse(bodyText) : undefined,
+          }
+          calls.push(call)
+          if (call.url.pathname === "/warp-source/sync/history") return yield* HttpServerResponse.json([])
+          if (call.url.pathname === "/warp-target/sync/replay")
+            return yield* HttpServerResponse.json({ sessionID: (call.json as { events: Array<{ aggregateID: string }> }).events[0]!.aggregateID })
+          if (call.url.pathname === "/warp-target/sync/steal") {
+            yield* Deferred.succeed(stealStarted, undefined)
+            yield* Deferred.await(releaseSteal)
+            return yield* stealResponse(call, sessionInfo!, destinationWorkspaceID!)
+          }
+          return HttpServerResponse.text("unexpected", { status: 500 })
+        }),
+      )
+      const url = yield* serverUrl()
+      yield* provideTmpdirInstance(
+        () =>
+          Effect.gen(function* () {
+            const workspace = yield* Workspace.Service
+            const sessionSvc = yield* SessionNs.Service
+            const instance = yield* requireInstance
+            const previousType = unique("warp-lock-source")
+            const targetType = unique("warp-lock-target")
+            const previous = workspaceInfo(instance.project.id, previousType)
+            const target = workspaceInfo(instance.project.id, targetType, { directory: "remote-target-dir" })
+            destinationWorkspaceID = target.id
+            yield* insertWorkspace(previous)
+            yield* insertWorkspace(target)
+            registerAdapter(instance.project.id, previousType, remoteAdapter(`${url}/warp-source`).adapter)
+            registerAdapter(instance.project.id, targetType, remoteAdapter(`${url}/warp-target`).adapter)
+            const session = yield* sessionSvc.create({})
+            sessionInfo = { ...session, workspaceID: previous.id }
+            const unrelated = yield* sessionSvc.create({})
+            yield* attachSessionToWorkspace(session.id, previous.id)
+
+            const warp = yield* workspace
+              .sessionWarp({ workspaceID: target.id, sessionID: session.id })
+              .pipe(Effect.forkChild)
+            yield* Deferred.await(stealStarted)
+            expect(
+              (yield* sessionSvc
+                .setTitle({ sessionID: unrelated.id, title: "unrelated update" })
+                .pipe(Effect.timeoutOption("100 millis")))._tag,
+            ).toBe("Some")
+            const update = yield* Effect.gen(function* () {
+              yield* Deferred.succeed(eventStarted, undefined)
+              const exit = yield* Effect.exit(
+                sessionSvc.updateMessage({
+                  id: MessageID.ascending(),
+                  sessionID: session.id,
+                  role: "user",
+                  time: { created: Date.now() },
+                  agent: "test",
+                  model: { providerID: "test", modelID: "test" },
+                  tools: {},
+                  mode: "",
+                } as unknown as SessionV1.Info),
+              )
+              yield* Deferred.succeed(eventDone, undefined)
+              return exit
+            }).pipe(Effect.forkChild)
+            const partUpdate = yield* Effect.gen(function* () {
+              yield* Deferred.succeed(partStarted, undefined)
+              const exit = yield* Effect.exit(
+                sessionSvc.updatePart({
+                  id: PartID.ascending(),
+                  sessionID: session.id,
+                  messageID: MessageID.ascending(),
+                  type: "text",
+                  text: "late source part",
+                }),
+              )
+              yield* Deferred.succeed(partDone, undefined)
+              return exit
+            }).pipe(Effect.forkChild)
+            yield* Deferred.await(eventStarted)
+            yield* Deferred.await(partStarted)
+            expect((yield* Deferred.await(eventDone).pipe(Effect.timeoutOption("100 millis")))._tag).toBe("None")
+            expect((yield* Deferred.await(partDone).pipe(Effect.timeoutOption("100 millis")))._tag).toBe("None")
+
+            yield* Deferred.succeed(releaseSteal, undefined)
+            const updateExit = yield* Fiber.join(update)
+            const partExit = yield* Fiber.join(partUpdate)
+            yield* Fiber.join(warp)
+
+            expect(Exit.isFailure(updateExit)).toBe(true)
+            expect(Exit.isFailure(partExit)).toBe(true)
+            expect((yield* sessionSvc.get(session.id)).workspaceID).toBe(target.id)
+            expect(calls.map((call) => `${call.method} ${call.url.pathname}`)).toEqual([
+              "POST /warp-source/sync/history",
+              "POST /warp-target/sync/replay",
+              "POST /warp-target/sync/steal",
+            ])
+          }),
+        { git: true },
+      )
+    })
+  })
+
+  it.live("sessionWarp keeps source events delivered during a failed warp", () => {
+    const calls: FetchCall[] = []
+    let sourceEvent: EventV2.SerializedEvent | undefined
+    let sourceOwner: WorkspaceV2.ID | undefined
+    return Effect.gen(function* () {
+      yield* HttpServer.serveEffect()(
+        Effect.gen(function* () {
+          const req = yield* HttpServerRequest.HttpServerRequest
+          const bodyText = yield* req.text
+          const call = {
+            url: new URL(req.url, "http://localhost"),
+            method: req.method,
+            headers: new Headers(req.headers),
+            bodyText,
+            json: bodyText ? JSON.parse(bodyText) : undefined,
+          }
+          calls.push(call)
+          if (call.url.pathname === "/warp-source/sync/history") return yield* HttpServerResponse.json([])
+          if (call.url.pathname === "/warp-target/sync/replay") {
+            const events = yield* EventV2.Service
+            yield* events.replay(sourceEvent!, { ownerID: sourceOwner })
+            return yield* HttpServerResponse.json({ sessionID: (call.json as { events: Array<{ aggregateID: string }> }).events[0]!.aggregateID })
+          }
+          if (call.url.pathname === "/warp-target/sync/steal") return HttpServerResponse.text("stale", { status: 409 })
+          return HttpServerResponse.text("unexpected", { status: 500 })
+        }),
+      )
+      const url = yield* serverUrl()
+      yield* provideTmpdirInstance(
+        () =>
+          Effect.gen(function* () {
+            const workspace = yield* Workspace.Service
+            const sessionSvc = yield* SessionNs.Service
+            const instance = yield* requireInstance
+            const previousType = unique("warp-steal-source")
+            const targetType = unique("warp-steal-target")
+            const previous = workspaceInfo(instance.project.id, previousType)
+            const target = workspaceInfo(instance.project.id, targetType, { directory: "remote-target-dir" })
+            yield* insertWorkspace(previous)
+            yield* insertWorkspace(target)
+            registerAdapter(instance.project.id, previousType, remoteAdapter(`${url}/warp-source`).adapter)
+            registerAdapter(instance.project.id, targetType, remoteAdapter(`${url}/warp-target`).adapter)
+            const session = yield* sessionSvc.create({})
+            yield* attachSessionToWorkspace(session.id, previous.id)
+            sourceOwner = previous.id
+            sourceEvent = {
+              id: EventV2.ID.create(),
+              aggregateID: session.id,
+              seq: 1,
+              type: "session.updated.1",
+              data: {
+                sessionID: session.id,
+                info: JSON.parse(
+                  JSON.stringify({
+                    ...session,
+                    workspaceID: previous.id,
+                    title: "source event during failed warp",
+                  }),
+                ),
+              },
+            }
+
+            const exit = yield* workspace
+              .sessionWarp({ workspaceID: target.id, sessionID: session.id })
+              .pipe(Effect.exit)
+            expectExitContains(exit, "WorkspaceSessionWarpConflictError", "expected sequence 0, found 1")
+            expect((yield* sessionSvc.get(session.id)).workspaceID).toBe(previous.id)
+            expect((yield* sessionSvc.get(session.id)).title).toBe("source event during failed warp")
+            expect(yield* sessionSequenceOwner(session.id)).toBe(previous.id)
+            expect(calls.map((call) => `${call.method} ${call.url.pathname}`)).toEqual([
+              "POST /warp-source/sync/history",
+              "POST /warp-target/sync/replay",
+            ])
+          }),
+        { git: true },
+      )
+    })
+  })
+
+  timeoutIt.live(
+    "sessionWarp restores project ownership when timeout reconciliation returns non-2xx",
+    () => {
+      return Effect.gen(function* () {
+        yield* provideTmpdirInstance(
+          () =>
+            Effect.gen(function* () {
+              const workspace = yield* Workspace.Service
+              const sessionSvc = yield* SessionNs.Service
+              const instance = yield* requireInstance
+              const targetType = unique("warp-timeout-target")
+              const target = workspaceInfo(instance.project.id, targetType, { directory: "remote-target-dir" })
+              yield* insertWorkspace(target)
+              registerAdapter(instance.project.id, targetType, remoteAdapter("http://test/warp-target").adapter)
+              const session = yield* sessionSvc.create({})
+
+              const exit = yield* workspace
+                .sessionWarp({ workspaceID: target.id, sessionID: session.id })
+                .pipe(Effect.exit)
+              expectExitContains(exit, "WorkspaceSessionWarpHttpError", "Timed out stealing session")
+              expect(yield* sessionSequenceOwner(session.id)).toBe(instance.project.id)
+              yield* sessionSvc.setTitle({ sessionID: session.id, title: "after timeout" })
+              expect((yield* sessionSvc.get(session.id)).title).toBe("after timeout")
+            }),
+          { git: true },
+        )
+      })
+    },
+    20_000,
+  )
+
+  it.live(
+    "sessionWarp restores ownership when interrupted during destination steal",
+    () =>
+      Effect.gen(function* () {
+        const stealStarted = yield* Deferred.make<void>()
+        const finishSteal = yield* Deferred.make<void>()
+        yield* HttpServer.serveEffect()(
+          Effect.gen(function* () {
+            const req = yield* HttpServerRequest.HttpServerRequest
+            const bodyText = yield* req.text
+            const body = (bodyText ? JSON.parse(bodyText) : {}) as { events?: Array<{ aggregateID?: string }> }
+            const url = new URL(req.url, "http://localhost")
+            if (url.pathname === "/warp-target/sync/replay")
+              return yield* HttpServerResponse.json({ sessionID: body.events?.[0]?.aggregateID ?? "ok" })
+            if (url.pathname === "/warp-target/sync/steal") {
+              yield* Deferred.succeed(stealStarted, undefined)
+              yield* Deferred.await(finishSteal)
+              return yield* HttpServerResponse.json({ sessionID: "late" })
+            }
+            return HttpServerResponse.text("unexpected", { status: 500 })
+          }),
+        )
+        const url = yield* serverUrl()
+        yield* provideTmpdirInstance(
+          () =>
+            Effect.gen(function* () {
+              const workspace = yield* Workspace.Service
+              const sessionSvc = yield* SessionNs.Service
+              const instance = yield* requireInstance
+              const targetType = unique("warp-interrupt-target")
+              const target = workspaceInfo(instance.project.id, targetType, { directory: "remote-target-dir" })
+              yield* insertWorkspace(target)
+              registerAdapter(instance.project.id, targetType, remoteAdapter(`${url}/warp-target`).adapter)
+              const session = yield* sessionSvc.create({})
+
+              const fiber = yield* workspace
+                .sessionWarp({ workspaceID: target.id, sessionID: session.id })
+                .pipe(Effect.forkChild)
+              yield* Deferred.await(stealStarted)
+              yield* Fiber.interrupt(fiber)
+              yield* Deferred.succeed(finishSteal, undefined)
+
+              expect(yield* sessionSequenceOwner(session.id)).toBe(instance.project.id)
+              yield* sessionSvc.setTitle({ sessionID: session.id, title: "after interruption" })
+              expect((yield* sessionSvc.get(session.id)).title).toBe("after interruption")
+            }),
+          { git: true },
+        )
+      }),
+    20_000,
+  )
+
+  it.live("sessionWarp reconciles a committed steal when the first response is lost", () => {
+    let sessionInfo: SessionNs.Info | undefined
+    let destinationWorkspaceID: WorkspaceV2.ID | undefined
+    let stealEvent: FetchCall | undefined
+    let steals = 0
+    return Effect.gen(function* () {
+      yield* HttpServer.serveEffect()(
+        Effect.gen(function* () {
+          const req = yield* HttpServerRequest.HttpServerRequest
+          const bodyText = yield* req.text
+          const call: FetchCall = {
+            url: new URL(req.url, "http://localhost"),
+            method: req.method,
+            headers: new Headers(req.headers),
+            bodyText,
+            json: bodyText ? JSON.parse(bodyText) : undefined,
+          }
+          if (call.url.pathname === "/warp-source/sync/history") return yield* HttpServerResponse.json([])
+          if (call.url.pathname === "/warp-target/sync/replay")
+            return yield* HttpServerResponse.json({ sessionID: (call.json as { events: Array<{ aggregateID: string }> }).events[0]!.aggregateID })
+          if (call.url.pathname === "/warp-target/sync/steal") {
+            steals++
+            stealEvent ??= call
+            if (steals === 1) return HttpServerResponse.text("{", { status: 200, contentType: "application/json" })
+            return yield* stealResponse(stealEvent, sessionInfo!, destinationWorkspaceID!)
+          }
+          return HttpServerResponse.text("unexpected", { status: 500 })
+        }),
+      )
+      const url = yield* serverUrl()
+      yield* provideTmpdirInstance(
+        () =>
+          Effect.gen(function* () {
+            const workspace = yield* Workspace.Service
+            const sessionSvc = yield* SessionNs.Service
+            const instance = yield* requireInstance
+            const previousType = unique("warp-loss-source")
+            const targetType = unique("warp-loss-target")
+            const previous = workspaceInfo(instance.project.id, previousType)
+            const target = workspaceInfo(instance.project.id, targetType, { directory: "remote-target-dir" })
+            destinationWorkspaceID = target.id
+            yield* insertWorkspace(previous)
+            yield* insertWorkspace(target)
+            registerAdapter(instance.project.id, previousType, remoteAdapter(`${url}/warp-source`).adapter)
+            registerAdapter(instance.project.id, targetType, remoteAdapter(`${url}/warp-target`).adapter)
+            const session = yield* sessionSvc.create({})
+            sessionInfo = { ...session, workspaceID: previous.id }
+            yield* attachSessionToWorkspace(session.id, previous.id)
+
+            yield* workspace.sessionWarp({ workspaceID: target.id, sessionID: session.id })
+
+            expect(steals).toBe(2)
+            expect((yield* sessionSvc.get(session.id)).workspaceID).toBe(target.id)
+            expect(yield* sessionSequenceOwner(session.id)).toBe(target.id)
+          }),
+        { git: true },
+      )
+    })
+  })
+
+  it.live(
+    "sessionWarp adopts a prior-attempt destination commit after steal responses remain lost",
+    () => {
+      let destinationWorkspaceID: WorkspaceV2.ID | undefined
+      let committed = false
+      const destinationEvents: Array<{
+        id: EventV2.ID
+        aggregate_id: SessionID
+        seq: number
+        type: string
+        data: Record<string, unknown>
+      }> = []
+      return Effect.gen(function* () {
+        yield* HttpServer.serveEffect()(
+          Effect.gen(function* () {
+            const req = yield* HttpServerRequest.HttpServerRequest
+            const bodyText = yield* req.text
+            const body = (bodyText ? JSON.parse(bodyText) : {}) as {
+              sessionID?: SessionID
+              seq?: number
+              warpID?: string
+              [sessionID: string]: SessionID | string | number | undefined
+            }
+            const url = new URL(req.url, "http://localhost")
+            if (url.pathname === "/warp-target/sync/replay")
+              return yield* HttpServerResponse.json({
+                sessionID: (body as unknown as { events?: Array<{ aggregateID?: string }> }).events?.[0]?.aggregateID ?? "ok",
+              })
+            if (url.pathname === "/warp-target/sync/steal") {
+              if (!committed) {
+                const sessionSvc = yield* SessionNs.Service
+                const info = yield* sessionSvc.get(body.sessionID!)
+                const next = {
+                  ...info,
+                  workspaceID: destinationWorkspaceID!,
+                  time: { ...info.time, updated: Date.now() },
+                }
+                destinationEvents.push({
+                  id: EventV2.ID.create(),
+                  aggregate_id: body.sessionID!,
+                  seq: Number(body.seq) + 1,
+                  type: "session.updated.1",
+                  data: { sessionID: body.sessionID!, info: next },
+                })
+                committed = true
+              }
+              return HttpServerResponse.text("{", { contentType: "application/json" })
+            }
+            if (url.pathname === "/warp-target/sync/history") {
+              return yield* HttpServerResponse.json(
+                destinationEvents.filter(
+                  (event) =>
+                    event.aggregate_id === Object.keys(body)[0]! && event.seq > Number(Object.values(body)[0]),
+                ),
+              )
+            }
+            return HttpServerResponse.text("unexpected", { status: 500 })
+          }),
+        )
+        const url = yield* serverUrl()
+        yield* provideTmpdirInstance(
+          () =>
+            Effect.gen(function* () {
+              const workspace = yield* Workspace.Service
+              const sessionSvc = yield* SessionNs.Service
+              const instance = yield* requireInstance
+              const targetType = unique("warp-timeout-commit")
+              const target = workspaceInfo(instance.project.id, targetType, { directory: "remote-target-dir" })
+              destinationWorkspaceID = target.id
+              yield* insertWorkspace(target)
+              registerAdapter(instance.project.id, targetType, remoteAdapter(`${url}/warp-target`).adapter)
+              const session = yield* sessionSvc.create({})
+
+              yield* workspace.sessionWarp({ workspaceID: target.id, sessionID: session.id })
+
+              expect((yield* sessionSvc.get(session.id)).workspaceID).toBe(target.id)
+              expect(yield* sessionSequenceOwner(session.id)).toBe(target.id)
+              expect(yield* sessionSequence(session.id)).toBe(2)
+            }),
+          { git: true },
+        )
+      })
+    },
+    20_000,
+  )
+
+  it.live(
+    "sessionWarp reconciles a real destination handler commit after its response is lost",
+    () => {
+      let destinationDirectory = ""
+      let destinationWorkspaceID: WorkspaceV2.ID | undefined
+      let steals = 0
+      return Effect.gen(function* () {
+        yield* HttpServer.serveEffect()(
+          Effect.gen(function* () {
+            const req = yield* HttpServerRequest.HttpServerRequest
+            const body = yield* req.text
+            const url = new URL(req.url, "http://localhost")
+            const headers = new Headers(req.headers)
+            headers.set("x-opencode-directory", destinationDirectory)
+            const request = new Request(`http://localhost${url.pathname.replace("/real-target", "")}`, {
+              method: req.method,
+              headers,
+              body: body || undefined,
+            })
+            const previousWorkspaceID = Flag.OPENCODE_WORKSPACE_ID
+            const response = yield* Effect.promise(() => {
+              Flag.OPENCODE_WORKSPACE_ID = destinationWorkspaceID
+              return HttpApiApp.webHandler().handler(request, Context.empty() as Context.Context<unknown>)
+            }).pipe(
+              Effect.ensuring(
+                Effect.sync(() => {
+                  Flag.OPENCODE_WORKSPACE_ID = previousWorkspaceID
+                }),
+              ),
+            )
+            if (url.pathname === "/real-target/sync/steal") {
+              steals++
+              expect(response.status).toBe(200)
+              return HttpServerResponse.text("{", { contentType: "application/json" })
+            }
+            return HttpServerResponse.fromWeb(response)
+          }),
+        )
+        const url = yield* serverUrl()
+        yield* provideTmpdirInstance(
+          (dir) =>
+            Effect.gen(function* () {
+              const workspace = yield* Workspace.Service
+              const sessionSvc = yield* SessionNs.Service
+              const instance = yield* requireInstance
+              destinationDirectory = path.join(dir, "real-destination")
+              yield* Effect.promise(() => fs.mkdir(destinationDirectory, { recursive: true }))
+              const targetType = unique("warp-real-timeout")
+              const target = workspaceInfo(instance.project.id, targetType, { directory: destinationDirectory })
+              destinationWorkspaceID = target.id
+              yield* insertWorkspace(target)
+              registerAdapter(instance.project.id, targetType, remoteAdapter(`${url}/real-target`).adapter)
+              const session = yield* sessionSvc.create({})
+
+              yield* workspace.sessionWarp({ workspaceID: target.id, sessionID: session.id })
+
+              expect(steals).toBeGreaterThan(1)
+              expect((yield* sessionSvc.get(session.id)).workspaceID).toBe(target.id)
+              expect(yield* sessionSequenceOwner(session.id)).toBe(target.id)
+              expect(yield* sessionSequence(session.id)).toBe(2)
+            }),
+          { git: true },
+        )
+      })
+    },
+    20_000,
+  )
+
+  it.instance("durable session removals reject a stale local owner", () =>
+    Effect.gen(function* () {
+      const sessionSvc = yield* SessionNs.Service
+      const events = yield* EventV2.Service
+      const session = yield* sessionSvc.create({})
+      const sequence = yield* sessionSequence(session.id)
+      yield* events.claim(session.id, WorkspaceV2.ID.make(`wrk_${unique("remote-owner")}`))
+
+      expect(
+        Exit.isFailure(
+          yield* sessionSvc
+            .removeMessage({ sessionID: session.id, messageID: MessageID.ascending() })
+            .pipe(Effect.exit),
+        ),
+      ).toBe(true)
+      expect(
+        Exit.isFailure(
+          yield* sessionSvc
+            .removePart({
+              sessionID: session.id,
+              messageID: MessageID.ascending(),
+              partID: PartID.ascending(),
+            })
+            .pipe(Effect.exit),
+        ),
+      ).toBe(true)
+      expect(Exit.isFailure(yield* sessionSvc.remove(session.id).pipe(Effect.exit))).toBe(true)
+
+      expect(yield* sessionSequence(session.id)).toBe(sequence)
+      expect((yield* sessionSvc.get(session.id)).id).toBe(session.id)
+    }),
+  )
 
   it.live("sessionWarp refuses a non-replayable session before remote side effects", () => {
     const calls: FetchCall[] = []
@@ -1416,6 +2094,86 @@ describe("workspace sync state", () => {
     }),
   )
 
+  it.live("a stream that emits one event then fails reconnects through the backoff", () => {
+    const eventConnections: number[] = []
+    return Effect.gen(function* () {
+      yield* HttpServer.serveEffect()(
+        Effect.gen(function* () {
+          const req = yield* HttpServerRequest.HttpServerRequest
+          const url = new URL(req.url, "http://localhost")
+          if (url.pathname === "/stream-failed/global/event") {
+            eventConnections.push(Date.now())
+            // The first connection forwards one event and then fails; every
+            // later connection serves a healthy keep-open stream.
+            if (eventConnections.length === 1)
+              return HttpServerResponse.fromWeb(
+                brokenEventStreamResponse({ payload: { type: "stream.marker", properties: { from: "broken" } } }),
+              )
+            return HttpServerResponse.fromWeb(eventStreamResponse())
+          }
+          if (url.pathname === "/stream-failed/sync/history")
+            return HttpServerResponse.fromWeb(Response.json([]))
+          return HttpServerResponse.text("unexpected", { status: 500 })
+        }),
+      )
+      const url = yield* serverUrl()
+      yield* provideTmpdirInstance(
+        () =>
+          Effect.gen(function* () {
+            const workspace = yield* Workspace.Service
+            const sessionSvc = yield* SessionNs.Service
+            const instance = yield* requireInstance
+            const captured = captureGlobalEvents()
+            try {
+              const type = unique("remote-stream-fail")
+              const info = workspaceInfo(instance.project.id, type)
+              yield* insertWorkspace(info)
+              registerAdapter(instance.project.id, type, remoteAdapter(`${url}/stream-failed`).adapter)
+              yield* attachSessionToWorkspace((yield* sessionSvc.create({})).id, info.id)
+
+              yield* workspace.startWorkspaceSyncing(instance.project.id)
+
+              // The event from the broken stream is forwarded before it fails.
+              yield* eventuallyEffect(
+                Effect.gen(function* () {
+                  expect(
+                    captured.events.some(
+                      (event) => event.workspace === info.id && event.payload.type === "stream.marker",
+                    ),
+                  ).toBe(true)
+                }),
+              )
+
+              // The mid-stream failure must not kill the listener: the loop
+              // reconnects through the existing backoff and returns to
+              // connected instead of parking the workspace on error.
+              yield* eventuallyEffect(
+                Effect.gen(function* () {
+                  expect(eventConnections.length).toBeGreaterThanOrEqual(2)
+                  expect((yield* workspace.status()).find((item) => item.workspaceID === info.id)?.status).toBe(
+                    "connected",
+                  )
+                }),
+                4_000,
+              )
+              expect(
+                captured.events
+                  .filter(
+                    (event) => event.workspace === info.id && event.payload.type === Workspace.Event.Status.type,
+                  )
+                  .map((event) => event.payload.properties.status),
+              ).toEqual(["disconnected", "connecting", "connected", "disconnected", "connecting", "connected"])
+              expect(yield* workspace.isSyncing(info.id)).toBe(true)
+              yield* workspace.remove(info.id)
+            } finally {
+              captured.dispose()
+            }
+          }),
+        { git: true },
+      )
+    })
+  })
+
   it.live("sync history sends the local sequence fence and replays returned events in workspace context", () => {
     const historyBodies: unknown[] = []
     let historySessionID: SessionID | undefined
@@ -1704,7 +2462,7 @@ describe("workspace waitForSync", () => {
   )
 
   it.instance(
-    "a sync event for a different workspace can also release the fence",
+    "a sync event for a different workspace does not release the fence before the deadline",
     () =>
       Effect.gen(function* () {
         const workspace = yield* Workspace.Service
@@ -1713,9 +2471,16 @@ describe("workspace waitForSync", () => {
         const { db } = yield* Database.Service
         yield* db.insert(EventSequenceTable).values({ aggregate_id: sessionID, seq: 0 }).run().pipe(Effect.orDie)
 
+        // The database reaches the target while only unrelated-workspace sync
+        // events arrive. Those events must not release the fence early; it
+        // completes through the deadline's final synced check.
+        const started = Date.now()
+        let finished = Number.POSITIVE_INFINITY
         yield* Effect.all(
           [
-            workspace.waitForSync(workspaceID, { [sessionID]: 1 }),
+            workspace.waitForSync(workspaceID, { [sessionID]: 1 }, undefined, 300).pipe(
+              Effect.tap(() => Effect.sync(() => (finished = Date.now()))),
+            ),
             Effect.gen(function* () {
               yield* Effect.sleep("10 millis")
               yield* db
@@ -1724,16 +2489,23 @@ describe("workspace waitForSync", () => {
                 .where(eq(EventSequenceTable.aggregate_id, sessionID))
                 .run()
                 .pipe(Effect.orDie)
-              GlobalBus.emit("event", {
-                workspace: WorkspaceV2.ID.ascending("wrk_other_workspace"),
-                payload: { type: "sync" },
-              })
+              for (let index = 0; index < 40; index++) {
+                GlobalBus.emit("event", {
+                  workspace: WorkspaceV2.ID.ascending("wrk_other_workspace"),
+                  payload: { type: "sync" },
+                })
+                yield* Effect.sleep("20 millis")
+              }
             }),
           ],
           { concurrency: "unbounded" },
         )
+        const elapsed = finished - started
+        expect(elapsed).toBeGreaterThanOrEqual(300)
+        expect(elapsed).toBeLessThan(700)
       }),
     { git: true },
+    5000,
   )
 
   it.instance(
@@ -1772,5 +2544,51 @@ describe("workspace waitForSync", () => {
       }),
     { git: true },
     7000,
+  )
+
+  it.instance(
+    "a chatty unrelated-sync workload does not extend the fence deadline",
+    () =>
+      Effect.gen(function* () {
+        const workspace = yield* Workspace.Service
+        const workspaceID = WorkspaceV2.ID.ascending("wrk_wait_chatty")
+        const sessionID = SessionID.descending("ses_wait_chatty")
+        const { db } = yield* Database.Service
+        // The stored sequence stays below the requested fence, so only the
+        // deadline can end the wait.
+        yield* db.insert(EventSequenceTable).values({ aggregate_id: sessionID, seq: 0 }).run().pipe(Effect.orDie)
+
+        const other = WorkspaceV2.ID.ascending("wrk_chatty_other")
+        const chatty = Effect.gen(function* () {
+          for (let index = 0; index < 40; index++) {
+            yield* Effect.sleep("20 millis")
+            GlobalBus.emit("event", { workspace: other, payload: { type: "sync" } })
+          }
+        })
+
+        const started = Date.now()
+        let finished = Number.POSITIVE_INFINITY
+        const [exit] = yield* Effect.all(
+          [
+            Effect.exit(workspace.waitForSync(workspaceID, { [sessionID]: 5 }, undefined, 300)).pipe(
+              Effect.tap(() => Effect.sync(() => (finished = Date.now()))),
+            ),
+            chatty,
+          ],
+          { concurrency: 2 },
+        )
+        const elapsed = finished - started
+        expectExitContains(
+          exit,
+          "WorkspaceSyncTimeoutError",
+          `Timed out waiting for sync fence: {"${sessionID}":5}`,
+        )
+        // The deadline is honored even though unrelated sync events keep
+        // arriving for 800ms after it passed under the old timer-reset bug.
+        expect(elapsed).toBeGreaterThanOrEqual(300)
+        expect(elapsed).toBeLessThan(700)
+      }),
+    { git: true },
+    5000,
   )
 })

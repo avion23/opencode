@@ -4408,7 +4408,7 @@ export class History extends HeyApiClient {
   /**
    * List sync events
    *
-   * List sync events for all aggregates. Keys are aggregate IDs the client already knows about, values are the last known sequence ID. Events with seq > value are returned for those aggregates. Aggregates not listed in the input get their full history.
+   * List newer sync events for the requested aggregates. Keys are aggregate IDs and values are the last known sequence ID.
    */
   public list<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -4537,10 +4537,12 @@ export class Sync extends HeyApiClient {
    * Update a session to belong to the current workspace through the sync event system.
    */
   public steal<ThrowOnError extends boolean = false>(
-    parameters?: {
+    parameters: {
       directory?: string
       workspace?: string
-      sessionID?: string
+      sessionID: string
+      seq: number
+      warpID: string
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -4552,6 +4554,8 @@ export class Sync extends HeyApiClient {
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
             { in: "body", key: "sessionID" },
+            { in: "body", key: "seq" },
+            { in: "body", key: "warpID" },
           ],
         },
       ],

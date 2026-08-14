@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, Stream } from "effect"
+import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Logger, Option, Schema, Stream } from "effect"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Event } from "@opencode-ai/schema/event"
 import { Session } from "@opencode-ai/schema/session"
@@ -1036,6 +1036,7 @@ describe("EventV2", () => {
       const { db } = yield* Database.Service
       const aggregateID = Session.ID.create()
       const received = new Array<EventV2.Payload>()
+      const logs = new Array<string>()
       yield* events.listen((event) => Effect.sync(() => received.push(event)))
 
       yield* events.replay(
@@ -1057,6 +1058,14 @@ describe("EventV2", () => {
           data: durableData(aggregateID, "ignored"),
         },
         { ownerID: "owner-2", publish: true },
+      ).pipe(
+        Effect.provide(
+          Logger.layer([
+            Logger.make(({ message }) => {
+              logs.push(String(message))
+            }),
+          ]),
+        ),
       )
       const rows = yield* db
         .select()
@@ -1074,6 +1083,7 @@ describe("EventV2", () => {
       expect(rows).toHaveLength(1)
       expect(sequence).toEqual({ seq: 0, ownerID: "owner-1" })
       expect(received).toHaveLength(0)
+      expect(logs.some((log) => log.startsWith("event replay dropped due to owner mismatch"))).toBe(true)
     }),
   )
 
