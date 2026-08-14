@@ -40,6 +40,7 @@ type FinishResult = {
   info?: Info
   done?: Deferred.Deferred<Info>
   scope?: Scope.Closeable
+  token?: object
 }
 
 type PromoteResult = {
@@ -121,12 +122,27 @@ function errorText(error: unknown) {
  * live work. Persisted observation, restart recovery, and remote workers need a
  * separate durable ownership slice rather than pretending this registry has
  * those semantics.
+ *
+ * Terminal entries are evicted after {@link EVICTION_GRACE} so late `wait()`
+ * callers can still read output. The token captured at settlement guards
+ * against evicting a re-started job that reused the same id.
  */
+const EVICTION_GRACE = "5 minutes"
+
 export const make = Effect.gen(function* () {
   const state: State = {
     jobs: yield* SynchronizedRef.make(new Map()),
     scope: yield* Scope.Scope,
   }
+
+  const evict = (id: string, token: object) =>
+    SynchronizedRef.modify(state.jobs, (jobs): readonly [void, Map<string, Active>] => {
+      const job = jobs.get(id)
+      if (!job || job.token !== token) return [undefined, jobs]
+      const next = new Map(jobs)
+      next.delete(id)
+      return [undefined, next]
+    })
 
   const settle = Effect.fn("BackgroundJob.settle")(function* (
     id: string,
@@ -166,11 +182,18 @@ export const make = Effect.gen(function* () {
           ...(Exit.isFailure(exit) ? { error: errorText(Cause.squash(exit.cause)) } : {}),
         },
       }
-      return [{ info: snapshot(next), done: job.done, scope: job.scope }, new Map(jobs).set(id, next)]
+      return [{ info: snapshot(next), done: job.done, scope: job.scope, token }, new Map(jobs).set(id, next)]
     })
     if (result.info && result.done) yield* Deferred.succeed(result.done, result.info).pipe(Effect.ignore)
     if (result.scope) {
       yield* Scope.close(result.scope, Exit.void).pipe(Effect.forkIn(state.scope, { startImmediately: true }))
+    }
+    if (result.token) {
+      yield* Effect.sleep(EVICTION_GRACE).pipe(
+        Effect.andThen(evict(id, result.token)),
+        Effect.ignore,
+        Effect.forkIn(state.scope, { startImmediately: true }),
+      )
     }
     return result.info
   })
@@ -355,9 +378,17 @@ export const make = Effect.gen(function* () {
           completed_at,
         },
       }
-      return [{ info: snapshot(next), done: job.done, scope: job.scope }, new Map(jobs).set(id, next)]
+      return [{ info: snapshot(next), done: job.done, scope: job.scope, token: job.token }, new Map(jobs).set(id, next)]
     })
     if (result.info && result.done) yield* Deferred.succeed(result.done, result.info).pipe(Effect.ignore)
+    // Terminal retention starts at the state transition, independent of scope finalizer completion.
+    if (result.token) {
+      yield* Effect.sleep(EVICTION_GRACE).pipe(
+        Effect.andThen(evict(id, result.token)),
+        Effect.ignore,
+        Effect.forkIn(state.scope, { startImmediately: true }),
+      )
+    }
     if (result.scope) yield* Scope.close(result.scope, Exit.void)
     return result.info
   })

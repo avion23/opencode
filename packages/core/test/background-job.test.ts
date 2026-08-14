@@ -1,7 +1,8 @@
 import { describe, expect } from "bun:test"
 import { BackgroundJob } from "@opencode-ai/core/background-job"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Cause, Deferred, Effect, Exit, Schema, Scope } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Schema, Scope } from "effect"
+import { TestClock } from "effect/testing"
 import { it } from "./lib/effect"
 
 const jobsLayer = LayerNode.compile(BackgroundJob.node)
@@ -9,6 +10,108 @@ const jobsLayer = LayerNode.compile(BackgroundJob.node)
 class MessageLessError extends Schema.TaggedErrorClass<MessageLessError>()("MessageLessError", {}) {}
 
 describe("BackgroundJob", () => {
+  it.effect("keeps completed jobs for five minutes before eviction", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const job = yield* jobs.start({ type: "test", run: Effect.succeed("done") })
+      expect(yield* jobs.wait({ id: job.id })).toMatchObject({ info: { status: "completed", output: "done" } })
+      yield* Effect.yieldNow
+
+      yield* TestClock.adjust(Duration.millis(299_000))
+      expect((yield* jobs.get(job.id))?.status).toBe("completed")
+
+      yield* TestClock.adjust("1 second")
+      expect(yield* jobs.get(job.id)).toBeUndefined()
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
+  it.effect("keeps cancelled jobs for five minutes before eviction", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const job = yield* jobs.start({ type: "test", run: Effect.never })
+      expect((yield* jobs.cancel(job.id))?.status).toBe("cancelled")
+      yield* Effect.yieldNow
+
+      yield* TestClock.adjust(Duration.millis(299_000))
+      expect((yield* jobs.get(job.id))?.status).toBe("cancelled")
+
+      yield* TestClock.adjust("1 second")
+      expect(yield* jobs.get(job.id)).toBeUndefined()
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
+  it.effect("evicts cancelled jobs while finalizers are blocked without evicting restarted jobs", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const blockedID = "job_blocked_cancel"
+      const blockedStarted = yield* Deferred.make<void>()
+      const blockedFinalizer = yield* Deferred.make<void>()
+      const releaseBlockedFinalizer = yield* Deferred.make<void>()
+      yield* jobs.start({
+        id: blockedID,
+        type: "test",
+        run: Deferred.succeed(blockedStarted, undefined).pipe(
+          Effect.andThen(Effect.never),
+          Effect.ensuring(
+            Deferred.succeed(blockedFinalizer, undefined).pipe(Effect.andThen(Deferred.await(releaseBlockedFinalizer))),
+          ),
+        ),
+      })
+      yield* Deferred.await(blockedStarted)
+      const blockedObservation = yield* Effect.gen(function* () {
+        yield* Deferred.await(blockedFinalizer)
+        yield* TestClock.adjust("5 minutes")
+        expect(yield* jobs.get(blockedID)).toBeUndefined()
+      }).pipe(Effect.ensuring(Deferred.succeed(releaseBlockedFinalizer, undefined)), Effect.forkChild)
+      expect((yield* jobs.cancel(blockedID))?.status).toBe("cancelled")
+      yield* Fiber.join(blockedObservation)
+
+      const restartedID = "job_restarted_during_cancel"
+      const restartedStarted = yield* Deferred.make<void>()
+      const restartedFinalizer = yield* Deferred.make<void>()
+      const releaseRestartedFinalizer = yield* Deferred.make<void>()
+      yield* jobs.start({
+        id: restartedID,
+        type: "test",
+        run: Deferred.succeed(restartedStarted, undefined).pipe(
+          Effect.andThen(Effect.never),
+          Effect.ensuring(
+            Deferred.succeed(restartedFinalizer, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseRestartedFinalizer)),
+            ),
+          ),
+        ),
+      })
+      yield* Deferred.await(restartedStarted)
+      const restartedObservation = yield* Effect.gen(function* () {
+        yield* Deferred.await(restartedFinalizer)
+        yield* jobs.start({ id: restartedID, type: "test", run: Effect.never })
+        yield* TestClock.adjust("5 minutes")
+        expect(yield* jobs.get(restartedID)).toMatchObject({ id: restartedID, status: "running" })
+      }).pipe(Effect.ensuring(Deferred.succeed(releaseRestartedFinalizer, undefined)), Effect.forkChild)
+      expect((yield* jobs.cancel(restartedID))?.status).toBe("cancelled")
+      yield* Fiber.join(restartedObservation)
+      yield* jobs.cancel(restartedID)
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
+  it.effect("does not evict a restarted job when the old timer expires", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const id = "job_restarted"
+      yield* jobs.start({ id, type: "test", run: Effect.succeed("first") })
+      expect((yield* jobs.wait({ id })).info?.status).toBe("completed")
+      yield* Effect.yieldNow
+      yield* TestClock.adjust("4 minutes")
+
+      yield* jobs.start({ id, type: "test", run: Effect.never })
+      yield* TestClock.adjust("1 minute")
+
+      expect(yield* jobs.get(id)).toMatchObject({ id, status: "running" })
+      yield* jobs.cancel(id)
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
   it.live("renders a tag when a failed error has no message", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
