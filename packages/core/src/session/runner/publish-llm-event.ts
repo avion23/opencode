@@ -83,7 +83,9 @@ export const createLLMEventPublisher = (service: EventV2.Interface, input: Input
     assistantMessageID = SessionMessage.ID.create()
     assistantActive = true
     yield* events.publish(SessionEvent.Step.Started, {
-      ...input,
+      sessionID: input.sessionID,
+      agent: input.agent,
+      model: input.model,
       assistantMessageID,
       timestamp: yield* timestamp,
       snapshot: input.snapshot,

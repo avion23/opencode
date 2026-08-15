@@ -71,6 +71,16 @@ const result = LLMEvent.toolResult({
   },
 })
 
+test("step started live data excludes the internal owner", async () => {
+  const { published, publisher } = capture()
+  await Effect.runPromise(publisher.publish(LLMEvent.textStart({ id: "text-owner" })))
+
+  const started = published.find((event) => event.type === "session.next.step.started.1")
+  expect(started).toBeDefined()
+  expect(started?.data).not.toHaveProperty("owner")
+  expect(started?.data).toMatchObject({ sessionID, agent: "build" })
+})
+
 test("local tool success serializes media base64 once and reconstructs from structured content", async () => {
   const { published, publisher } = capture()
   await Effect.runPromise(publisher.publish(call))
