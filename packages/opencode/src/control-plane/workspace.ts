@@ -942,6 +942,19 @@ const layer = Layer.effect(
               body: JSON.stringify(replayRaw),
             })
 
+          // A durable event landing on the local aggregate after the replay
+          // snapshot was read (e.g. a source event delivered while the remote
+          // replay was in flight) makes the snapshot stale. Abort before any
+          // claim or steal so the destination never observes an inconsistent
+          // sequence, and so source events that arrived during the failed warp
+          // remain delivered on the source owner.
+          const latest = yield* EventV2.latestSequence(db, input.sessionID)
+          if (latest !== replaySnapshot.seq)
+            return yield* new SessionWarpConflictError({
+              message: `Session events changed during warp: expected sequence ${replaySnapshot.seq}, found ${latest}`,
+              sessionID: input.sessionID,
+            })
+
           yield* events.claim(input.sessionID, workspaceID)
           const stealResult = yield* Effect.gen(function* () {
             const response = yield* http
