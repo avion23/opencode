@@ -13,6 +13,7 @@ const DEFAULT_BUFFER = 20_000
 const DEFAULT_KEEP_TOKENS = 8_000
 const TOOL_OUTPUT_MAX_CHARS = 2_000
 const SUMMARY_OUTPUT_TOKENS = 4_096
+const CHARS_PER_TOKEN = 4
 const SUMMARY_TEMPLATE = `Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
 <template>
 ## Objective
@@ -145,15 +146,32 @@ export const select = (
   if (conversation.length === 0) return
   let total = 0
   let split = conversation.length
+  let headEnd = conversation.length
+  let splitPrefix = ""
+  let splitSuffix = ""
   for (let index = conversation.length - 1; index >= 0; index--) {
     const next = total + Token.estimate(conversation[index])
-    if (next > tokens) break
+    if (next > tokens) {
+      const remaining = Math.max(0, tokens - total) * CHARS_PER_TOKEN
+      // Keep older messages whole. Only the newest message can be split so its
+      // latest instructions remain verbatim without changing the normal
+      // complete-message selection boundary.
+      if (index === conversation.length - 1 && remaining > 0 && conversation[index].length > remaining) {
+        const suffixStart = conversation[index].length - remaining
+        splitPrefix = conversation[index].slice(0, suffixStart)
+        splitSuffix = conversation[index].slice(suffixStart)
+        split = index + 1
+        headEnd = index
+      }
+      break
+    }
     total = next
     split = index
+    headEnd = index
   }
   return {
-    head: conversation.slice(0, split).join("\n\n"),
-    recent: conversation.slice(split).join("\n\n"),
+    head: [...conversation.slice(0, headEnd), splitPrefix].filter(Boolean).join("\n\n"),
+    recent: [splitSuffix, ...conversation.slice(split)].filter(Boolean).join("\n\n"),
   }
 }
 
