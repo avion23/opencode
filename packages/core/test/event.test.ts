@@ -1182,6 +1182,141 @@ describe("EventV2", () => {
     }),
   )
 
+  it.effect("retains an owned sequence row as a deletion fence", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      const owner = EventV2.strictOwner("owner-a")
+
+      yield* events.publish(DurableMessage, durableData(aggregateID, "first"), owner)
+      yield* events.publish(DurableMessage, durableData(aggregateID, "second"), owner)
+      yield* events.remove(aggregateID, owner)
+
+      expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).all()).toEqual([])
+      expect(
+        yield* db
+          .select({ seq: EventSequenceTable.seq, ownerID: EventSequenceTable.owner_id })
+          .from(EventSequenceTable)
+          .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+          .get()
+          .pipe(Effect.orDie),
+      ).toEqual({ seq: 1, ownerID: owner.ownerID })
+
+      const replay = yield* events
+        .replay(
+          {
+            id: EventV2.ID.create(),
+            type: EventV2.versionedType(DurableMessage.type, 1),
+            seq: 0,
+            aggregateID,
+            data: durableData(aggregateID, "stale"),
+          },
+          { ...owner },
+        )
+        .pipe(Effect.exit)
+
+      expect(String(replay)).toContain("Replay diverged")
+      expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).all()).toEqual([])
+    }),
+  )
+
+  it.effect("rejects removal by a different owner", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+
+      yield* events.publish(DurableMessage, durableData(aggregateID, "owned"), EventV2.strictOwner("owner-a"))
+      const removal = yield* events.remove(aggregateID, EventV2.strictOwner("owner-b")).pipe(Effect.exit)
+
+      expect(String(removal)).toContain("Remove owner mismatch")
+      expect(
+        yield* db
+          .select({ seq: EventSequenceTable.seq, ownerID: EventSequenceTable.owner_id })
+          .from(EventSequenceTable)
+          .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+          .get()
+          .pipe(Effect.orDie),
+      ).toEqual({ seq: 0, ownerID: "owner-a" })
+      expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).all()).toHaveLength(1)
+    }),
+  )
+
+  it.effect("waits for the aggregate lock before removing durable state", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      const lockStarted = yield* Deferred.make<void>()
+      const releaseLock = yield* Deferred.make<void>()
+      const removalDone = yield* Deferred.make<void>()
+
+      yield* events.publish(DurableMessage, durableData(aggregateID, "locked"))
+      const lock = yield* events
+        .exclusive(
+          aggregateID,
+          Deferred.succeed(lockStarted, undefined).pipe(Effect.andThen(Deferred.await(releaseLock))),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(lockStarted)
+
+      const removal = yield* events
+        .remove(aggregateID)
+        .pipe(Effect.andThen(Deferred.succeed(removalDone, undefined)), Effect.forkChild)
+      yield* Effect.yieldNow
+
+      expect(yield* Deferred.isDone(removalDone)).toBe(false)
+      expect(
+        yield* db
+          .select({ seq: EventSequenceTable.seq })
+          .from(EventSequenceTable)
+          .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+          .get()
+          .pipe(Effect.orDie),
+      ).toEqual({ seq: 0 })
+
+      yield* Deferred.succeed(releaseLock, undefined)
+      yield* Fiber.join(lock)
+      yield* Fiber.join(removal)
+      expect(yield* Deferred.isDone(removalDone)).toBe(true)
+      expect(
+        yield* db.select().from(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, aggregateID)).get(),
+      ).toBe(undefined)
+    }),
+  )
+
+  it.effect("does not publish or insert a stale replay after owned removal", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      const owner = EventV2.strictOwner("owner-a")
+      const received = new Array<EventV2.Payload>()
+
+      yield* events.publish(DurableMessage, durableData(aggregateID, "owned"), owner)
+      yield* events.listen((event) => Effect.sync(() => received.push(event)))
+      yield* events.remove(aggregateID, owner)
+
+      const replay = yield* events
+        .replay(
+          {
+            id: EventV2.ID.create(),
+            type: EventV2.versionedType(DurableMessage.type, 1),
+            seq: 0,
+            aggregateID,
+            data: durableData(aggregateID, "stale"),
+          },
+          { ...owner, publish: true },
+        )
+        .pipe(Effect.exit)
+
+      expect(String(replay)).toContain("Replay diverged")
+      expect(received).toEqual([])
+      expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).all()).toEqual([])
+    }),
+  )
+
   it.effect("remove clears durable event sequence", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service

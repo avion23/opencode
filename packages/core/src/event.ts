@@ -171,7 +171,10 @@ export interface Interface {
     events: SerializedEvent[],
     options?: { readonly publish?: boolean; readonly ownerID?: string; readonly strictOwner?: boolean },
   ) => Effect.Effect<string | undefined>
-  readonly remove: (aggregateID: string) => Effect.Effect<void>
+  readonly remove: (
+    aggregateID: string,
+    options?: { readonly ownerID?: string; readonly strictOwner?: boolean },
+  ) => Effect.Effect<void>
   readonly claim: (aggregateID: string, ownerID: string) => Effect.Effect<void>
   readonly exclusive: <A, E, R>(aggregateID: string, effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
 }
@@ -607,15 +610,46 @@ export const layerWith = (options?: LayerOptions) =>
         })
       }
 
-      function remove(aggregateID: string) {
-        return db
-          .transaction(() =>
-            Effect.gen(function* () {
-              yield* db.delete(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, aggregateID)).run()
-              yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).run()
-            }),
-          )
-          .pipe(Effect.orDie)
+      function remove(aggregateID: string, options?: { readonly ownerID?: string; readonly strictOwner?: boolean }) {
+        return exclusive(
+          aggregateID,
+          db
+            .transaction(
+              () =>
+                Effect.gen(function* () {
+                  const row = yield* db
+                    .select({ seq: EventSequenceTable.seq, ownerID: EventSequenceTable.owner_id })
+                    .from(EventSequenceTable)
+                    .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+                    .get()
+                    .pipe(Effect.orDie)
+                  if (options?.strictOwner) {
+                    if (options.ownerID === undefined)
+                      yield* Effect.die(
+                        new OwnerFenceError({
+                          type: "remove",
+                          message: `Remove strict owner requires ownerID for aggregate ${aggregateID}`,
+                        }),
+                      )
+                    if (row?.ownerID && row.ownerID !== options.ownerID)
+                      yield* Effect.die(
+                        new OwnerFenceError({
+                          type: "remove",
+                          message: `Remove owner mismatch for aggregate ${aggregateID}: expected ${row.ownerID}, got ${options.ownerID}`,
+                        }),
+                      )
+                  }
+                  if (options?.strictOwner && row?.ownerID) {
+                    yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).run()
+                  } else {
+                    yield* db.delete(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, aggregateID)).run()
+                    yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).run()
+                  }
+                }),
+              { behavior: "immediate" },
+            )
+            .pipe(Effect.orDie),
+        )
       }
 
       function claim(aggregateID: string, ownerID: string) {
