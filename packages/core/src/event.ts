@@ -35,7 +35,7 @@ export const latestSequence = Effect.fn("EventV2.latestSequence")(function* (
   aggregateID: string,
 ) {
   const row = yield* db
-    .select({ seq: EventSequenceTable.seq })
+    .select({ seq: EventSequenceTable.seq, removed: EventSequenceTable.removed })
     .from(EventSequenceTable)
     .where(eq(EventSequenceTable.aggregate_id, aggregateID))
     .get()
@@ -44,8 +44,11 @@ export const latestSequence = Effect.fn("EventV2.latestSequence")(function* (
   // A fenced-removal tombstone retains the sequence row while deleting every
   // event row. With no replayable events the advertised latest sequence is -1
   // rather than the retained fence seq, so readers never observe a phantom
-  // sequence for an aggregate whose history was removed.
-  if (!(yield* hasEvents(db, aggregateID))) return -1
+  // sequence for an aggregate whose history was removed. The durable `removed`
+  // marker (not the absence of event rows) identifies the tombstone: the
+  // move/claim flow legitimately holds a fence-row-only state with an owner
+  // and no events yet.
+  if (row.removed) return -1
   return row.seq
 })
 
@@ -308,19 +311,22 @@ export const layerWith = (options?: LayerOptions) =>
                         () =>
                           Effect.gen(function* () {
                             const row = yield* db
-                              .select({ seq: EventSequenceTable.seq, ownerID: EventSequenceTable.owner_id })
+                              .select({
+                                seq: EventSequenceTable.seq,
+                                ownerID: EventSequenceTable.owner_id,
+                                removed: EventSequenceTable.removed,
+                              })
                               .from(EventSequenceTable)
                               .where(eq(EventSequenceTable.aggregate_id, aggregateID))
                               .get()
                               .pipe(Effect.orDie)
                             const latest = row?.seq ?? -1
                             // Fenced-removal tombstone: the sequence row is retained as
-                            // the deletion fence while every event row is deleted. No
-                            // EventTable row for the aggregate means its history was
-                            // deliberately removed by its owner. Applies to replays AND
-                            // local publishes so neither can resurrect the aggregate.
-                            const tombstoned =
-                              row != null && !(yield* hasEvents(db, aggregateID))
+                            // the deletion fence while every event row is deleted. The
+                            // durable `removed` marker identifies the tombstone — the
+                            // move/claim flow's fence-row-only state (owner set, no
+                            // events yet) must NOT be treated as removed.
+                            const tombstoned = row?.removed === true
                             if (!input && strictLocalOwner) {
                               if (localOwnerID === undefined)
                                 yield* Effect.die(
@@ -700,6 +706,14 @@ export const layerWith = (options?: LayerOptions) =>
                     }
                     if (options?.strictOwner && row?.ownerID) {
                       yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).run()
+                      // Retain the sequence row as the deletion fence and mark it as
+                      // a durable tombstone so the move/claim fence-row-only state
+                      // (owner set, no events) is never conflated with a removal.
+                      yield* db
+                        .update(EventSequenceTable)
+                        .set({ removed: true })
+                        .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+                        .run()
                     } else {
                       yield* db.delete(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, aggregateID)).run()
                       yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).run()

@@ -5,6 +5,12 @@ export const EventSequenceTable = sqliteTable("event_sequence", {
   aggregate_id: text().notNull().primaryKey(),
   seq: integer().notNull(),
   owner_id: text(),
+  // Durable tombstone marker: set only by the fenced-removal path (events.remove
+  // with strictOwner + recorded owner). Distinguishes a real removal tombstone
+  // (sequence row retained as the deletion fence, all event rows deleted) from
+  // the legitimate fence-row-only state produced by the move/claim flow (a
+  // seq-0 row with an owner and no events yet).
+  removed: integer({ mode: "boolean" }).notNull().default(false),
 })
 
 export const EventTable = sqliteTable(
