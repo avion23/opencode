@@ -49,6 +49,9 @@ export function createEmbeddedRoutes() {
 }
 
 function makeRoutes<AuthError, AuthServices>(auth: Layer.Layer<ServerAuth.Config, AuthError, AuthServices>) {
+  // Single process-global SessionExecutionLocal shared by Workspace and
+  // SessionV2: Core's run coordinator and quiesce barrier are process-scoped,
+  // so per-request/per-session instances would split ownership.
   const serviceLayer = AppNodeBuilder.build(applicationServices, [[SessionExecution.node, SessionExecutionLocal.node]])
 
   return HttpApiBuilder.layer(Api, { openapiPath: "/openapi.json" }).pipe(

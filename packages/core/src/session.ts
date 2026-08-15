@@ -27,6 +27,7 @@ import { fromRow } from "./session/info"
 import { SessionRunner } from "./session/runner/index"
 import { SessionStore } from "./session/store"
 import { SessionExecution } from "./session/execution"
+import type { QuiescingError } from "./session/run-coordinator"
 import { makeGlobalNode } from "./effect/app-node"
 import { LocationServiceMap } from "./location-service-map"
 import { MessageDecodeError } from "./session/error"
@@ -169,7 +170,9 @@ export interface Interface {
   readonly compact: (input: CompactInput) => Effect.Effect<void, NotFoundError | OperationUnavailableError>
   readonly wait: (id: SessionSchema.ID) => Effect.Effect<void, NotFoundError | OperationUnavailableError>
   readonly active: Effect.Effect<ReadonlySet<SessionSchema.ID>>
-  readonly resume: (sessionID: SessionSchema.ID) => Effect.Effect<void, NotFoundError | SessionRunner.RunError>
+  readonly resume: (
+    sessionID: SessionSchema.ID,
+  ) => Effect.Effect<void, NotFoundError | SessionRunner.RunError | QuiescingError>
   readonly interrupt: (sessionID: SessionSchema.ID) => Effect.Effect<void>
   readonly revert: {
     readonly stage: (input: {

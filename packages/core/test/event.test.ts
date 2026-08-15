@@ -1315,6 +1315,38 @@ describe("EventV2", () => {
     }),
   )
 
+  it.effect("local publish on a tombstoned aggregate dies without inserting or publishing", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      const owner = EventV2.strictOwner("owner-a")
+      const received = new Array<EventV2.Payload>()
+
+      yield* events.publish(DurableMessage, durableData(aggregateID, "first"), owner)
+      yield* events.publish(DurableMessage, durableData(aggregateID, "second"), owner)
+      yield* events.listen((event) => Effect.sync(() => received.push(event)))
+      yield* events.remove(aggregateID, owner)
+
+      // A local publish (Moved/ContextUpdated racing the removal) must not
+      // re-create event rows behind the retained fence sequence: the removed
+      // aggregate stays removed, nothing is inserted, nothing is published.
+      const publish = yield* events.publish(DurableMessage, durableData(aggregateID, "resurrect")).pipe(Effect.exit)
+      expect(Exit.isFailure(publish) && Cause.hasDies(publish.cause)).toBe(true)
+      expect(String(publish)).toContain("Publish fenced")
+      expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).all()).toEqual([])
+      expect(received).toEqual([])
+      expect(
+        yield* db
+          .select({ seq: EventSequenceTable.seq, ownerID: EventSequenceTable.owner_id })
+          .from(EventSequenceTable)
+          .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+          .get()
+          .pipe(Effect.orDie),
+      ).toEqual({ seq: 1, ownerID: owner.ownerID })
+    }),
+  )
+
   it.effect("latestSequence reports no events for a fenced-removal aggregate", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service

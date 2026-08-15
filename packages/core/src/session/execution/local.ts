@@ -7,7 +7,11 @@ import { SessionSchema } from "../schema"
 import { SessionStore } from "../store"
 import { SessionExecution } from "../execution"
 
-/** Current-process routing for implicit-local Locations. Future remote placement belongs here. */
+/**
+ * Current-process routing for implicit-local Locations. Future remote placement belongs here.
+ * The app graph must provide one shared process-global instance of this node to both Workspace and
+ * SessionV2; separate coordinators would allow the same Session ID to drain concurrently.
+ */
 const layer = Layer.effect(
   SessionExecution.Service,
   Effect.gen(function* () {

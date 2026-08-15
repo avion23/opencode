@@ -317,9 +317,10 @@ export const layerWith = (options?: LayerOptions) =>
                             // Fenced-removal tombstone: the sequence row is retained as
                             // the deletion fence while every event row is deleted. No
                             // EventTable row for the aggregate means its history was
-                            // deliberately removed by its owner.
+                            // deliberately removed by its owner. Applies to replays AND
+                            // local publishes so neither can resurrect the aggregate.
                             const tombstoned =
-                              row != null && input != null && !(yield* hasEvents(db, aggregateID))
+                              row != null && !(yield* hasEvents(db, aggregateID))
                             if (!input && strictLocalOwner) {
                               if (localOwnerID === undefined)
                                 yield* Effect.die(
@@ -373,6 +374,20 @@ export const layerWith = (options?: LayerOptions) =>
                               // were already applied and then removed — silent
                               // idempotent no-op instead of a fatal "Replay diverged".
                               return
+                            }
+                            if (tombstoned) {
+                              // A local publish (Moved/ContextUpdated racing the
+                              // removal) would re-create event rows behind the
+                              // retained fence sequence and resurrect the removed
+                              // aggregate — fence it. The strict-local-owner check
+                              // above ran first, so an owner mismatch surfaces as
+                              // OwnerFenceError before this rejection.
+                              yield* Effect.die(
+                                new InvalidDurableEventError({
+                                  type: event.type,
+                                  message: `Publish fenced: aggregate ${aggregateID} was removed at sequence ${latest}`,
+                                }),
+                              )
                             }
                             if (input && input.seq <= latest) {
                               const stored = yield* db

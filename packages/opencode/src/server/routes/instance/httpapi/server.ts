@@ -298,6 +298,9 @@ export function createRoutes(
     Layer.provide(
       AppNodeBuilderV1.build(SessionV2.node, [
         [LocationServiceMap.node, locationServiceMapV2],
+        // Single process-global SessionExecutionLocal shared by Workspace and
+        // SessionV2: Core's run coordinator and quiesce barrier are process-
+        // scoped, so per-request/per-session instances would split ownership.
         [SessionExecution.node, SessionExecutionLocal.node],
       ]),
     ),

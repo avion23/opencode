@@ -247,7 +247,7 @@ describe("Session owner fencing", () => {
       const entry = (seq: number, text: string) => ({
         seq,
         message: SessionMessage.User.make({
-          id: SessionMessage.ID.make(`moved_msg_${seq}`),
+          id: SessionMessage.ID.make(`msg_moved_${seq}`),
           type: "user",
           text,
           time: { created: DateTime.makeUnsafe(0) },

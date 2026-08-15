@@ -4,13 +4,14 @@ import { Context, Effect, Layer } from "effect"
 import { LayerNode } from "../effect/layer-node"
 import { Node } from "../effect/app-node"
 import { SessionRunner } from "./runner/index"
+import type { QuiesceError, QuiescingError } from "./run-coordinator"
 import { SessionSchema } from "./schema"
 
 export interface Interface {
   /** Snapshots active execution owned by this process. */
   readonly active: Effect.Effect<ReadonlySet<SessionSchema.ID>>
   /** Starts execution while idle or joins the active execution. */
-  readonly resume: (sessionID: SessionSchema.ID) => Effect.Effect<void, SessionRunner.RunError>
+  readonly resume: (sessionID: SessionSchema.ID) => Effect.Effect<void, SessionRunner.RunError | QuiescingError>
   /** Registers newly recorded work. Repeated wakeups may coalesce. */
   readonly wake: (sessionID: SessionSchema.ID) => Effect.Effect<void>
   /** Interrupt active work owned by this process. Idle interruption is a no-op. */
@@ -19,7 +20,7 @@ export interface Interface {
    * Stops active work, suppresses follow-up wakes, and waits for a clean settle.
    * Used when ownership of the Session moves so the old location drains to idle.
    */
-  readonly quiesce: (sessionID: SessionSchema.ID) => Effect.Effect<void>
+  readonly quiesce: (sessionID: SessionSchema.ID) => Effect.Effect<void, QuiesceError>
 }
 
 /** Routes execution from a Session ID to the runner owned by that Session's Location. */
