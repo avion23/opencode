@@ -1210,6 +1210,16 @@ const layer = Layer.effect(
         .all()
         .pipe(Effect.orDie)
       const sessionIDs = new Set(sessions.map((sessionInfo) => sessionInfo.id))
+      // The fenced `session.remove` deletes each session under its workspaced
+      // owner. Sessions attached to this workspace are durable-owned by the
+      // workspace they were moved into, so claim their sequence rows to this
+      // workspace before deleting them — mirroring the setWorkspace+claim
+      // convention — otherwise the strict owner fence rejects the deletion.
+      yield* Effect.forEach(
+        sessions,
+        (sessionInfo) => events.claim(sessionInfo.id, id),
+        { discard: true },
+      )
       yield* Effect.forEach(
         sessions.filter((sessionInfo) => !sessionInfo.parentID || !sessionIDs.has(sessionInfo.parentID)),
         (sessionInfo) =>
