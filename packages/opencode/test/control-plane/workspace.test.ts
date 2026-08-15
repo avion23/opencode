@@ -304,7 +304,7 @@ function brokenEventStreamResponse(event: unknown) {
     new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`))
-        controller.error(new Error("event stream failed mid-flight"))
+        setTimeout(() => controller.error(new Error("event stream failed mid-flight")), 10)
       },
     }),
     { status: 200, headers: { "content-type": "text/event-stream" } },
@@ -1936,6 +1936,128 @@ describe("workspace CRUD", () => {
       )
     })
   })
+
+  it.live(
+    "sessionWarp does not adopt a non-warp destination event during reconciliation",
+    () => {
+      let destinationWorkspaceID: WorkspaceV2.ID | undefined
+      let foreignID: string | undefined
+      const destinationEvents: Array<{
+        id: string
+        aggregate_id: SessionID
+        seq: number
+        type: string
+        data: Record<string, unknown>
+      }> = []
+      return Effect.gen(function* () {
+        yield* HttpServer.serveEffect()(
+          Effect.gen(function* () {
+            const req = yield* HttpServerRequest.HttpServerRequest
+            const bodyText = yield* req.text
+            const body = (bodyText ? JSON.parse(bodyText) : {}) as {
+              sessionID?: SessionID
+              seq?: number
+              [sessionID: string]: SessionID | string | number | undefined
+            }
+            const url = new URL(req.url, "http://localhost")
+            if (url.pathname === "/warp-target/sync/replay")
+              return yield* HttpServerResponse.json({
+                sessionID:
+                  (body as unknown as { events?: Array<{ aggregateID?: string }> }).events?.[0]?.aggregateID ??
+                  "ok",
+              })
+            if (url.pathname === "/warp-target/sync/steal") {
+              const sessionSvc = yield* SessionNs.Service
+              const info = yield* sessionSvc.get(body.sessionID!)
+              const event = {
+                id: EventV2.ID.create(),
+                aggregate_id: body.sessionID!,
+                seq: Number(body.seq) + 1,
+                type: "session.updated.1",
+                data: {
+                  sessionID: body.sessionID!,
+                  info: {
+                    ...info,
+                    workspaceID: destinationWorkspaceID,
+                    time: { ...info.time, updated: Date.now() },
+                  },
+                },
+              }
+              foreignID = event.id
+              destinationEvents.push(event)
+              // A valid steal-shaped response whose event id is NOT the
+              // client's warpID: a non-warp update must not be adopted.
+              return yield* HttpServerResponse.json({
+                sessionID: body.sessionID,
+                event: {
+                  id: event.id,
+                  aggregateID: event.aggregate_id,
+                  seq: event.seq,
+                  type: event.type,
+                  data: event.data,
+                },
+              })
+            }
+            if (url.pathname === "/warp-target/sync/history") {
+              const state = (body as { state?: Record<string, number> }).state ?? {}
+              const aggregateID = Object.keys(state)[0]
+              const since = aggregateID ? (state[aggregateID] ?? -1) : -1
+              return yield* HttpServerResponse.json(
+                destinationEvents.filter(
+                  (event) => event.aggregate_id === aggregateID && event.seq > since,
+                ),
+              )
+            }
+            return HttpServerResponse.text("unexpected", { status: 500 })
+          }),
+        )
+        const url = yield* serverUrl()
+        yield* provideTmpdirInstance(
+          (dir) =>
+            Effect.gen(function* () {
+              const workspace = yield* Workspace.Service
+              const sessionSvc = yield* SessionNs.Service
+              const instance = yield* requireInstance
+              const { db } = yield* Database.Service
+              const sourceType = unique("warp-nonwarp-source")
+              const targetType = unique("warp-nonwarp-target")
+              const source = workspaceInfo(instance.project.id, sourceType)
+              const target = workspaceInfo(instance.project.id, targetType)
+              destinationWorkspaceID = target.id
+              yield* insertWorkspace(source)
+              yield* insertWorkspace(target)
+              registerAdapter(
+                instance.project.id,
+                sourceType,
+                localAdapter(path.join(dir, "warp-nonwarp-source")).adapter,
+              )
+              registerAdapter(instance.project.id, targetType, remoteAdapter(`${url}/warp-target`).adapter)
+              const session = yield* sessionSvc.create({})
+              yield* attachSessionToWorkspace(session.id, source.id)
+
+              const exit = yield* Effect.exit(
+                workspace.sessionWarp({ workspaceID: target.id, sessionID: session.id }),
+              )
+              expectExitContains(exit, "WorkspaceSessionWarpHttpError", "Timed out stealing session")
+
+              // The foreign event was NOT adopted: the client workspace, local
+              // sequence, and event store are all unchanged.
+              expect((yield* sessionSvc.get(session.id)).workspaceID).toBe(source.id)
+              expect(yield* sessionSequence(session.id)).toBe(0)
+              const stored = yield* db
+                .select({ id: EventTable.id })
+                .from(EventTable)
+                .where(eq(EventTable.id, foreignID as EventV2.ID))
+                .get()
+                .pipe(Effect.orDie)
+              expect(stored).toBeUndefined()
+            }),
+          { git: true },
+        )
+      })
+    },
+    20_000,
+  )
 })
 
 describe("workspace sync state", () => {
@@ -2346,7 +2468,7 @@ describe("workspace sync state", () => {
                   expect((yield* sessionSvc.get(session.id).pipe(Effect.orDie)).title).toBe("from history")
                 }),
               )
-              expect(historyBodies).toEqual([{ [session.id]: historyNextSeq - 1 }])
+              expect(historyBodies).toEqual([{ scope: "aggregate", state: { [session.id]: historyNextSeq - 1 } }])
               expect(
                 captured.events.some(
                   (event) =>

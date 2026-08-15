@@ -204,7 +204,7 @@ const RemoteApplyResponse = Schema.Struct({ applied: Schema.Boolean })
 
 type HistoryRequest =
   | { scope: "workspace" }
-  | { scope: "aggregate"; state: Record<string, number>; fence?: { sessionID: SessionID; ownerID: string } }
+  | { scope: "aggregate"; state?: Record<string, number>; fence?: { sessionID: SessionID; ownerID: string } }
 
 const layer = Layer.effect(
   Service,
@@ -375,7 +375,11 @@ const layer = Layer.effect(
       space: Info,
       url: URL | string,
       headers: HeadersInit | undefined,
-      request: HistoryRequest = { scope: "workspace" },
+      // The sync-loop history request is a per-session fence: every session
+      // in the workspace is sent with its last locally-replayed sequence so
+      // the remote side only returns events newer than the fence. Sessions
+      // without a local sequence yet use -1 to discover their full history.
+      request: HistoryRequest = { scope: "aggregate" },
       replayOwnerID = space.id,
     ) {
       const sessionIDs = (yield* db
@@ -398,12 +402,18 @@ const layer = Layer.effect(
       const payload: HistoryRequest =
         request.scope === "workspace"
           ? request
-          : {
-              ...request,
-              state: request.fence
-                ? { [request.fence.sessionID]: state[request.fence.sessionID] ?? -1 }
-                : request.state,
-            }
+          : request.fence
+            ? { ...request, state: { [request.fence.sessionID]: state[request.fence.sessionID] ?? -1 } }
+            : {
+                ...request,
+                // An explicit state wins (used by warp reconciliation); the
+                // sync loop's fence defaults to the full local sequence map,
+                // including -1 for sessions with no events yet.
+                state: request.state ?? {
+                  ...Object.fromEntries(sessionIDs.map((id) => [id, -1])),
+                  ...state,
+                },
+              }
 
       const response = yield* http.execute(
         HttpClientRequest.post(route(url, "/sync/history"), {
