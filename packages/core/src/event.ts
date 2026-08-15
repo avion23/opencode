@@ -19,6 +19,17 @@ export type { Data, Definition, Payload } from "@opencode-ai/schema/event"
 export type Subscriber<D extends Definition = Definition> = (event: Payload<D>) => Effect.Effect<void>
 export type Unsubscribe = Effect.Effect<void>
 
+export const hasEvents = Effect.fn("EventV2.hasEvents")(function* (db: Database.Interface["db"], aggregateID: string) {
+  const row = yield* db
+    .select({ id: EventTable.id })
+    .from(EventTable)
+    .where(eq(EventTable.aggregate_id, aggregateID))
+    .limit(1)
+    .get()
+    .pipe(Effect.orDie)
+  return row != null
+})
+
 export const latestSequence = Effect.fn("EventV2.latestSequence")(function* (
   db: Database.Interface["db"],
   aggregateID: string,
@@ -29,7 +40,13 @@ export const latestSequence = Effect.fn("EventV2.latestSequence")(function* (
     .where(eq(EventSequenceTable.aggregate_id, aggregateID))
     .get()
     .pipe(Effect.orDie)
-  return row?.seq ?? -1
+  if (!row) return -1
+  // A fenced-removal tombstone retains the sequence row while deleting every
+  // event row. With no replayable events the advertised latest sequence is -1
+  // rather than the retained fence seq, so readers never observe a phantom
+  // sequence for an aggregate whose history was removed.
+  if (!(yield* hasEvents(db, aggregateID))) return -1
+  return row.seq
 })
 
 export type SerializedEvent = {
@@ -297,6 +314,12 @@ export const layerWith = (options?: LayerOptions) =>
                               .get()
                               .pipe(Effect.orDie)
                             const latest = row?.seq ?? -1
+                            // Fenced-removal tombstone: the sequence row is retained as
+                            // the deletion fence while every event row is deleted. No
+                            // EventTable row for the aggregate means its history was
+                            // deliberately removed by its owner.
+                            const tombstoned =
+                              row != null && input != null && !(yield* hasEvents(db, aggregateID))
                             if (!input && strictLocalOwner) {
                               if (localOwnerID === undefined)
                                 yield* Effect.die(
@@ -334,6 +357,22 @@ export const layerWith = (options?: LayerOptions) =>
                                   }),
                                 )
                               }
+                            }
+                            if (tombstoned && input) {
+                              // F2: a replay beyond the tombstone sequence would
+                              // resurrect the removed aggregate — reject it outright.
+                              if (input.seq > latest)
+                                yield* Effect.die(
+                                  new InvalidDurableEventError({
+                                    type: event.type,
+                                    message: `Replay fenced: aggregate ${aggregateID} was removed at sequence ${latest}`,
+                                  }),
+                                )
+                              // F3: replays within the removed aggregate's consumed
+                              // range are at-least-once re-deliveries of events that
+                              // were already applied and then removed — silent
+                              // idempotent no-op instead of a fatal "Replay diverged".
+                              return
                             }
                             if (input && input.seq <= latest) {
                               const stored = yield* db
@@ -613,42 +652,48 @@ export const layerWith = (options?: LayerOptions) =>
       function remove(aggregateID: string, options?: { readonly ownerID?: string; readonly strictOwner?: boolean }) {
         return exclusive(
           aggregateID,
-          db
-            .transaction(
-              () =>
-                Effect.gen(function* () {
-                  const row = yield* db
-                    .select({ seq: EventSequenceTable.seq, ownerID: EventSequenceTable.owner_id })
-                    .from(EventSequenceTable)
-                    .where(eq(EventSequenceTable.aggregate_id, aggregateID))
-                    .get()
-                    .pipe(Effect.orDie)
-                  if (options?.strictOwner) {
-                    if (options.ownerID === undefined)
-                      yield* Effect.die(
-                        new OwnerFenceError({
-                          type: "remove",
-                          message: `Remove strict owner requires ownerID for aggregate ${aggregateID}`,
-                        }),
-                      )
-                    if (row?.ownerID && row.ownerID !== options.ownerID)
-                      yield* Effect.die(
-                        new OwnerFenceError({
-                          type: "remove",
-                          message: `Remove owner mismatch for aggregate ${aggregateID}: expected ${row.ownerID}, got ${options.ownerID}`,
-                        }),
-                      )
-                  }
-                  if (options?.strictOwner && row?.ownerID) {
-                    yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).run()
-                  } else {
-                    yield* db.delete(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, aggregateID)).run()
-                    yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).run()
-                  }
-                }),
-              { behavior: "immediate" },
-            )
-            .pipe(Effect.orDie),
+          // Uninterruptible for parity with commitDurableEvent: the exclusive
+          // transaction must run to completion once started so an interrupt
+          // cannot abort a removal mid-flight (the beta.83 interrupt path is
+          // not safe to cut a transaction short).
+          Effect.uninterruptible(
+            db
+              .transaction(
+                () =>
+                  Effect.gen(function* () {
+                    const row = yield* db
+                      .select({ seq: EventSequenceTable.seq, ownerID: EventSequenceTable.owner_id })
+                      .from(EventSequenceTable)
+                      .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+                      .get()
+                      .pipe(Effect.orDie)
+                    if (options?.strictOwner) {
+                      if (options.ownerID === undefined)
+                        yield* Effect.die(
+                          new OwnerFenceError({
+                            type: "remove",
+                            message: `Remove strict owner requires ownerID for aggregate ${aggregateID}`,
+                          }),
+                        )
+                      if (row?.ownerID && row.ownerID !== options.ownerID)
+                        yield* Effect.die(
+                          new OwnerFenceError({
+                            type: "remove",
+                            message: `Remove owner mismatch for aggregate ${aggregateID}: expected ${row.ownerID}, got ${options.ownerID}`,
+                          }),
+                        )
+                    }
+                    if (options?.strictOwner && row?.ownerID) {
+                      yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).run()
+                    } else {
+                      yield* db.delete(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, aggregateID)).run()
+                      yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).run()
+                    }
+                  }),
+                { behavior: "immediate" },
+              )
+              .pipe(Effect.orDie),
+          ),
         )
       }
 
