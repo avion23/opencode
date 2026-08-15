@@ -72,6 +72,8 @@ type Dependencies = {
     readonly stream: (request: LLMRequest) => Stream.Stream<LLMEvent, LLMError>
   }
   readonly config: readonly Config.Entry[]
+  /** Resolves the durable-owner fencing for a Session's compaction appends. */
+  readonly owner: (sessionID: SessionSchema.ID) => Effect.Effect<EventV2.StrictOwner>
 }
 
 type Input = {
@@ -207,12 +209,17 @@ export const make = (dependencies: Dependencies) => {
     const summaryOutput = Math.min(output || SUMMARY_OUTPUT_TOKENS, SUMMARY_OUTPUT_TOKENS)
     if (Token.estimate(summaryPrompt) > context - summaryOutput) return false
     const messageID = SessionMessage.ID.create()
-    yield* dependencies.events.publish(SessionEvent.Compaction.Started, {
-      sessionID: input.sessionID,
-      messageID,
-      timestamp: yield* DateTime.now,
-      reason: "auto",
-    })
+    const owner = yield* dependencies.owner(input.sessionID)
+    yield* dependencies.events.publish(
+      SessionEvent.Compaction.Started,
+      {
+        sessionID: input.sessionID,
+        messageID,
+        timestamp: yield* DateTime.now,
+        reason: "auto",
+      },
+      owner,
+    )
 
     const chunks: string[] = []
     let failed = false
@@ -237,14 +244,18 @@ export const make = (dependencies: Dependencies) => {
       )
     const summary = chunks.join("")
     if (!summarized || failed || !summary.trim()) return false
-    yield* dependencies.events.publish(SessionEvent.Compaction.Ended, {
-      sessionID: input.sessionID,
-      messageID,
-      timestamp: yield* DateTime.now,
-      reason: "auto",
-      text: summary,
-      recent: selected.recent,
-    })
+    yield* dependencies.events.publish(
+      SessionEvent.Compaction.Ended,
+      {
+        sessionID: input.sessionID,
+        messageID,
+        timestamp: yield* DateTime.now,
+        reason: "auto",
+        text: summary,
+        recent: selected.recent,
+      },
+      owner,
+    )
     return true
   })
   const compactIfNeeded = Effect.fn("SessionCompaction.compactIfNeeded")(function* (input: Input) {

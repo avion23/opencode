@@ -4,7 +4,7 @@ import { and, asc, eq, isNull, lte } from "drizzle-orm"
 import { DateTime, Effect, Schema } from "effect"
 import { Admitted, Delivery } from "@opencode-ai/schema/session-input"
 import type { Database } from "../database/database"
-import type { EventV2 } from "../event"
+import { EventV2 } from "../event"
 import { SessionEvent } from "./event"
 import { SessionMessage } from "./message"
 import { Prompt } from "./prompt"
@@ -46,19 +46,25 @@ export const admit = Effect.fn("SessionInput.admit")(function* (
     readonly sessionID: SessionSchema.ID
     readonly prompt: Prompt
     readonly delivery: Delivery
+    /** Durable-owner fencing for the admission append. */
+    readonly owner: EventV2.StrictOwner
   },
 ) {
   const existing = yield* find(db, input.id)
   if (existing !== undefined) return existing
   const timestamp = yield* DateTime.now
   return yield* events
-    .publish(SessionEvent.PromptAdmitted, {
-      messageID: input.id,
-      sessionID: input.sessionID,
-      timestamp,
-      prompt: input.prompt,
-      delivery: input.delivery,
-    })
+    .publish(
+      SessionEvent.PromptAdmitted,
+      {
+        messageID: input.id,
+        sessionID: input.sessionID,
+        timestamp,
+        prompt: input.prompt,
+        delivery: input.delivery,
+      },
+      input.owner,
+    )
     .pipe(
       Effect.flatMap((event) =>
         event.durable === undefined
@@ -75,7 +81,13 @@ export const admit = Effect.fn("SessionInput.admit")(function* (
             ),
       ),
       Effect.catchDefect((defect) =>
-        find(db, input.id).pipe(Effect.flatMap((stored) => (stored ? Effect.succeed(stored) : Effect.die(defect)))),
+        // An owner mismatch must stay a defect: swallowing it as an already-admitted
+        // prompt would let a stale location adopt another owner's admission.
+        defect instanceof EventV2.InvalidDurableEventError
+          ? Effect.die(defect)
+          : find(db, input.id).pipe(
+              Effect.flatMap((stored) => (stored ? Effect.succeed(stored) : Effect.die(defect))),
+            ),
       ),
     )
 })
@@ -218,17 +230,22 @@ const publish = Effect.fn("SessionInput.publish")(function* (
   events: EventV2.Interface,
   sessionID: SessionSchema.ID,
   rows: ReadonlyArray<typeof SessionInputTable.$inferSelect>,
+  owner: EventV2.StrictOwner,
 ) {
   for (const row of rows) {
     const id = SessionMessage.ID.make(row.id)
     yield* events
-      .publish(SessionEvent.Prompted, {
-        sessionID,
-        timestamp: DateTime.makeUnsafe(row.time_created),
-        messageID: id,
-        prompt: decodePrompt(row.prompt),
-        delivery: row.delivery,
-      })
+      .publish(
+        SessionEvent.Prompted,
+        {
+          sessionID,
+          timestamp: DateTime.makeUnsafe(row.time_created),
+          messageID: id,
+          prompt: decodePrompt(row.prompt),
+          delivery: row.delivery,
+        },
+        owner,
+      )
       .pipe(
         Effect.catchDefect((defect) =>
           defect instanceof LifecycleConflict
@@ -247,6 +264,7 @@ export const promoteSteers = Effect.fn("SessionInput.promoteSteers")(function* (
   events: EventV2.Interface,
   sessionID: SessionSchema.ID,
   cutoff: number,
+  owner: EventV2.StrictOwner,
 ) {
   const rows = yield* db
     .select()
@@ -262,13 +280,14 @@ export const promoteSteers = Effect.fn("SessionInput.promoteSteers")(function* (
     .orderBy(asc(SessionInputTable.admitted_seq))
     .all()
     .pipe(Effect.orDie)
-  return yield* publish(db, events, sessionID, rows)
+  return yield* publish(db, events, sessionID, rows, owner)
 })
 
 export const promoteNextQueued = Effect.fn("SessionInput.promoteNextQueued")(function* (
   db: DatabaseService,
   events: EventV2.Interface,
   sessionID: SessionSchema.ID,
+  owner: EventV2.StrictOwner,
 ) {
   const row = yield* db
     .select()
@@ -284,5 +303,5 @@ export const promoteNextQueued = Effect.fn("SessionInput.promoteNextQueued")(fun
     .limit(1)
     .get()
     .pipe(Effect.orDie)
-  return row === undefined ? false : yield* publish(db, events, sessionID, [row]).pipe(Effect.as(true))
+  return row === undefined ? false : yield* publish(db, events, sessionID, [row], owner).pipe(Effect.as(true))
 })

@@ -11,6 +11,8 @@ type Input = {
   readonly agent: string
   readonly model: ModelV2.Ref
   readonly snapshot?: string
+  /** Required durable-owner fencing applied to every internal publish. No defaults. */
+  readonly owner: EventV2.StrictOwner
 }
 
 const safe = (value: number | undefined) => Math.max(0, Number.isFinite(value) ? (value ?? 0) : 0)
@@ -51,7 +53,12 @@ const settledOutput = (value: ToolOutput | undefined, result: ToolResultValue): 
 }
 
 /** Persist one provider turn without executing tools or starting a continuation turn. */
-export const createLLMEventPublisher = (events: EventV2.Interface, input: Input) => {
+export const createLLMEventPublisher = (service: EventV2.Interface, input: Input) => {
+  // Every internal append is fenced by the required owner so a stale runner at an
+  // old location cannot persist provider-turn events for a moved session.
+  const events: Pick<EventV2.Interface, "publish"> = {
+    publish: ((definition, data) => service.publish(definition, data, input.owner)) as EventV2.Interface["publish"],
+  }
   const tools = new Map<
     string,
     {

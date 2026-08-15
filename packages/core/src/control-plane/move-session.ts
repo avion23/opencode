@@ -1,13 +1,17 @@
 export * as MoveSession from "./move-session"
 
 import { Context, DateTime, Effect, Layer, Schema } from "effect"
+import { eq } from "drizzle-orm"
 import { makeGlobalNode } from "../effect/app-node"
 import { EventV2 } from "../event"
+import { EventSequenceTable } from "../event/sql"
+import { Database } from "../database/database"
 import { Git } from "../git"
 import { Location } from "../location"
 import { ProjectV2 } from "../project"
 import { SessionV2 } from "../session"
 import { SessionEvent } from "../session/event"
+import { SessionOwner } from "../session/owner"
 import { SessionSchema } from "../session/schema"
 import { SessionStore } from "../session/store"
 import { AbsolutePath, RelativePath } from "../schema"
@@ -53,12 +57,22 @@ export class ResetSourceChangesError extends Schema.TaggedErrorClass<ResetSource
   },
 ) {}
 
+export class SourceOwnerMismatchError extends Schema.TaggedErrorClass<SourceOwnerMismatchError>()(
+  "MoveSession.SourceOwnerMismatchError",
+  {
+    sessionID: SessionSchema.ID,
+    durableOwner: Schema.String,
+    sourceOwner: Schema.String,
+  },
+) {}
+
 export type Error =
   | SessionV2.NotFoundError
   | DestinationProjectMismatchError
   | CaptureChangesError
   | ApplyChangesError
   | ResetSourceChangesError
+  | SourceOwnerMismatchError
 
 export interface Interface {
   readonly moveSession: (input: Input) => Effect.Effect<void, Error>
@@ -73,6 +87,7 @@ const layer = Layer.effect(
     const events = yield* EventV2.Service
     const project = yield* ProjectV2.Service
     const sessions = yield* SessionStore.Service
+    const db = (yield* Database.Service).db
 
     const moveSession = Effect.fn("MoveSession.moveSession")(function* (input: Input) {
       const current = yield* sessions.get(input.sessionID)
@@ -103,12 +118,32 @@ const layer = Layer.effect(
           .pipe(Effect.mapError((error) => new ApplyChangesError({ message: error.message })))
       }
 
-      yield* events.publish(SessionEvent.Moved, {
-        sessionID: input.sessionID,
-        location: Location.Ref.make({ directory }),
-        subdirectory: RelativePath.make(path.relative(destination.directory, directory).replaceAll("\\", "/")),
-        timestamp: yield* DateTime.now,
-      })
+      // The move must be written under the source owner: the event records the
+      // destination location but never claims destination ownership.
+      const sourceOwner = SessionOwner.ownerOf(current)
+      const sequence = yield* db
+        .select({ ownerID: EventSequenceTable.owner_id })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, input.sessionID))
+        .get()
+        .pipe(Effect.orDie)
+      if (sequence?.ownerID && sequence.ownerID !== sourceOwner)
+        return yield* new SourceOwnerMismatchError({
+          sessionID: input.sessionID,
+          durableOwner: sequence.ownerID,
+          sourceOwner,
+        })
+
+      yield* events.publish(
+        SessionEvent.Moved,
+        {
+          sessionID: input.sessionID,
+          location: Location.Ref.make({ directory }),
+          subdirectory: RelativePath.make(path.relative(destination.directory, directory).replaceAll("\\", "/")),
+          timestamp: yield* DateTime.now,
+        },
+        EventV2.strictOwner(sourceOwner),
+      )
 
       if (patch) {
         const repository = yield* git.repo.discover(current.location.directory)
@@ -144,5 +179,5 @@ const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: Service,
   layer,
-  deps: [Git.node, EventV2.node, ProjectV2.node, SessionStore.node],
+  deps: [Git.node, EventV2.node, Database.node, ProjectV2.node, SessionStore.node],
 })

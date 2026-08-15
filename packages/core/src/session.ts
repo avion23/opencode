@@ -38,6 +38,8 @@ import { Revert } from "@opencode-ai/schema/revert"
 import { FSUtil } from "./fs-util"
 import { SessionDurable } from "@opencode-ai/schema/durable-event-manifest"
 
+export { ownerOf, SessionOwner } from "./session/owner"
+
 export const RevertState = Revert.State
 export type RevertState = Revert.State
 
@@ -239,7 +241,10 @@ const layer = Layer.effect(
           time: { created: now, updated: now },
         })
         const projected = yield* events
-          .publish(SessionV1.Event.Created, { sessionID, info }, { location: input.location })
+          .publish(SessionV1.Event.Created, { sessionID, info }, {
+            location: input.location,
+            ...EventV2.strictOwner(input.location.workspaceID ?? project.id),
+          })
           .pipe(
             Effect.as({ type: "created" } as const),
             Effect.catchDefect((defect) => {
@@ -360,7 +365,7 @@ const layer = Layer.effect(
       prompt: Effect.fn("V2Session.prompt")((input) =>
         Effect.uninterruptible(
           Effect.gen(function* () {
-            yield* result.get(input.sessionID)
+            const session = yield* result.get(input.sessionID)
             const prompt = resolvePrompt(input.prompt)
             const messageID = input.id ?? SessionMessage.ID.create()
             const delivery = input.delivery ?? "steer"
@@ -370,6 +375,7 @@ const layer = Layer.effect(
               sessionID: input.sessionID,
               prompt,
               delivery,
+              owner: EventV2.strictOwner(SessionOwner.ownerOf(session)),
             }).pipe(
               Effect.catchDefect((defect) =>
                 defect instanceof SessionInput.LifecycleConflict
@@ -391,13 +397,17 @@ const layer = Layer.effect(
         return yield* new OperationUnavailableError({ operation: "skill" })
       }),
       switchAgent: Effect.fn("V2Session.switchAgent")(function* (input) {
-        yield* result.get(input.sessionID)
-        yield* events.publish(SessionEvent.AgentSwitched, {
-          sessionID: input.sessionID,
-          messageID: SessionMessage.ID.create(),
-          timestamp: yield* DateTime.now,
-          agent: input.agent,
-        })
+        const session = yield* result.get(input.sessionID)
+        yield* events.publish(
+          SessionEvent.AgentSwitched,
+          {
+            sessionID: input.sessionID,
+            messageID: SessionMessage.ID.create(),
+            timestamp: yield* DateTime.now,
+            agent: input.agent,
+          },
+          EventV2.strictOwner(SessionOwner.ownerOf(session)),
+        )
       }),
       switchModel: Effect.fn("V2Session.switchModel")(function* (input) {
         const session = yield* result.get(input.sessionID)
@@ -407,12 +417,16 @@ const layer = Layer.effect(
           (session.model.variant ?? "default") === (input.model.variant ?? "default")
         )
           return
-        yield* events.publish(SessionEvent.ModelSwitched, {
-          sessionID: input.sessionID,
-          messageID: SessionMessage.ID.create(),
-          timestamp: yield* DateTime.now,
-          model: input.model,
-        })
+        yield* events.publish(
+          SessionEvent.ModelSwitched,
+          {
+            sessionID: input.sessionID,
+            messageID: SessionMessage.ID.create(),
+            timestamp: yield* DateTime.now,
+            model: input.model,
+          },
+          EventV2.strictOwner(SessionOwner.ownerOf(session)),
+        )
       }),
       compact: Effect.fn("V2Session.compact")(function* (input) {
         yield* result.get(input.sessionID)

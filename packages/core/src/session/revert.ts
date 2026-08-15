@@ -8,6 +8,7 @@ import { RelativePath } from "../schema"
 import { Snapshot } from "../snapshot"
 import { SessionEvent } from "./event"
 import { SessionMessage } from "./message"
+import { SessionOwner } from "./owner"
 import { SessionSchema } from "./schema"
 import { SessionMessageTable } from "./sql"
 
@@ -87,11 +88,15 @@ export const stage = Effect.fn("SessionRevert.stage")(function* (input: {
       .trim(),
     files,
   } satisfies SessionSchema.Info["revert"]
-  yield* events.publish(SessionEvent.RevertEvent.Staged, {
-    sessionID: input.session.id,
-    timestamp: yield* DateTime.now,
-    revert,
-  })
+  yield* events.publish(
+    SessionEvent.RevertEvent.Staged,
+    {
+      sessionID: input.session.id,
+      timestamp: yield* DateTime.now,
+      revert,
+    },
+    EventV2.strictOwner(SessionOwner.ownerOf(input.session)),
+  )
   return revert
 })
 
@@ -104,18 +109,26 @@ export const clear = Effect.fn("SessionRevert.clear")(function* (session: Sessio
       files: new Map((session.revert.files ?? []).map((file) => [file.path, original])),
     })
   const events = yield* EventV2.Service
-  yield* events.publish(SessionEvent.RevertEvent.Cleared, {
-    sessionID: session.id,
-    timestamp: yield* DateTime.now,
-  })
+  yield* events.publish(
+    SessionEvent.RevertEvent.Cleared,
+    {
+      sessionID: session.id,
+      timestamp: yield* DateTime.now,
+    },
+    EventV2.strictOwner(SessionOwner.ownerOf(session)),
+  )
 })
 
 export const commit = Effect.fn("SessionRevert.commit")(function* (session: SessionSchema.Info) {
   if (!session.revert) return
   const events = yield* EventV2.Service
-  yield* events.publish(SessionEvent.RevertEvent.Committed, {
-    sessionID: session.id,
-    messageID: session.revert.messageID,
-    timestamp: yield* DateTime.now,
-  })
+  yield* events.publish(
+    SessionEvent.RevertEvent.Committed,
+    {
+      sessionID: session.id,
+      messageID: session.revert.messageID,
+      timestamp: yield* DateTime.now,
+    },
+    EventV2.strictOwner(SessionOwner.ownerOf(session)),
+  )
 })

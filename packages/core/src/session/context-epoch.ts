@@ -33,8 +33,9 @@ export function prepare(
   events: EventV2.Interface,
   context: Effect.Effect<SystemContext.SystemContext>,
   sessionID: SessionSchema.ID,
+  owner: EventV2.StrictOwner,
 ): Effect.Effect<Prepared, SystemContext.InitializationBlocked | ContextSnapshotDecodeError> {
-  return prepareOnce(db, events, context, sessionID).pipe(Effect.withSpan("SessionContextEpoch.prepare"))
+  return prepareOnce(db, events, context, sessionID, owner).pipe(Effect.withSpan("SessionContextEpoch.prepare"))
 }
 
 const prepareOnce = Effect.fnUntraced(function* (
@@ -42,6 +43,7 @@ const prepareOnce = Effect.fnUntraced(function* (
   events: EventV2.Interface,
   context: Effect.Effect<SystemContext.SystemContext>,
   sessionID: SessionSchema.ID,
+  owner: EventV2.StrictOwner,
 ) {
   const [value, stored, compaction] = yield* Effect.all(
     [context, find(db, sessionID), SessionHistory.latestCompaction(db, sessionID)],
@@ -72,7 +74,7 @@ const prepareOnce = Effect.fnUntraced(function* (
   yield* events.publish(
     SessionEvent.ContextUpdated,
     { sessionID, messageID: SessionMessage.ID.create(), timestamp: yield* DateTime.now, text: result.text },
-    { commit: () => advance(db, sessionID, result.snapshot).pipe(Effect.orDie) },
+    { ...owner, commit: () => advance(db, sessionID, result.snapshot).pipe(Effect.orDie) },
   )
   return { baseline: stored.baseline, baselineSeq: stored.baseline_seq }
 })
