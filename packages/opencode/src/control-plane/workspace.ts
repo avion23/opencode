@@ -906,9 +906,18 @@ const layer = Layer.effect(
           Effect.gen(function* () {
             const space = destination!
             const target = destinationTarget!
+            if (target.type !== "remote")
+              return yield* new SessionWarpHttpError({
+                message: `Destination for session ${input.sessionID} is not remote`,
+                workspaceID: workspaceID!,
+                sessionID: input.sessionID,
+                status: 500,
+                body: "",
+              })
+            const remoteTarget = target
             const response = yield* http.execute(
-              HttpClientRequest.post(route(target.url, "/sync/replay"), {
-                headers: new Headers(target.headers),
+              HttpClientRequest.post(route(remoteTarget.url, "/sync/replay"), {
+                headers: new Headers(remoteTarget.headers),
                 body: HttpBody.jsonUnsafe({
                   directory: space.directory ?? "",
                   events: replaySnapshot.rows,
@@ -921,7 +930,7 @@ const layer = Layer.effect(
               const body = yield* response.text
               return yield* new SessionWarpHttpError({
                 message: `Failed to warp session ${input.sessionID} into workspace ${workspaceID}: HTTP ${response.status} ${body}`,
-                workspaceID,
+                workspaceID: workspaceID!,
                 sessionID: input.sessionID,
                 status: response.status,
                 body,
@@ -933,7 +942,7 @@ const layer = Layer.effect(
               catch: (error) =>
                 new SessionWarpHttpError({
                   message: `Workspace replay response was invalid: ${errorData(error)}`,
-                  workspaceID,
+                  workspaceID: workspaceID!,
                   sessionID: input.sessionID,
                   status: 502,
                   body: JSON.stringify(replayRaw),
@@ -942,7 +951,7 @@ const layer = Layer.effect(
             if (replayResult.sessionID !== input.sessionID)
               return yield* new SessionWarpHttpError({
                 message: "Workspace replay response named the wrong session",
-                workspaceID,
+                workspaceID: workspaceID!,
                 sessionID: input.sessionID,
                 status: 502,
                 body: JSON.stringify(replayRaw),
@@ -957,7 +966,7 @@ const layer = Layer.effect(
         if (replayOutcome._tag === "None")
           return yield* new SessionWarpHttpError({
             message: `Timed out replaying session ${input.sessionID} into workspace ${workspaceID}`,
-            workspaceID,
+            workspaceID: workspaceID!,
             sessionID: input.sessionID,
             status: 504,
             body: "",
@@ -972,6 +981,15 @@ const layer = Layer.effect(
           Effect.gen(function* () {
             const space = destination!
             const target = destinationTarget!
+            if (target.type !== "remote")
+              return yield* new SessionWarpHttpError({
+                message: `Destination for session ${input.sessionID} is not remote`,
+                workspaceID: workspaceID!,
+                sessionID: input.sessionID,
+                status: 500,
+                body: "",
+              })
+            const remoteTarget = target
             const latest = (yield* db
               .select({ seq: EventSequenceTable.seq })
               .from(EventSequenceTable)
@@ -984,14 +1002,14 @@ const layer = Layer.effect(
                 sessionID: input.sessionID,
               })
 
-            yield* events.claim(input.sessionID, workspaceID)
+            yield* events.claim(input.sessionID, workspaceID!)
 
             const stealResult = yield* Effect.gen(function* () {
               const response = yield* runDetached(
                 http
                   .execute(
-                    HttpClientRequest.post(route(target.url, "/sync/steal"), {
-                      headers: new Headers(target.headers),
+                    HttpClientRequest.post(route(remoteTarget.url, "/sync/steal"), {
+                      headers: new Headers(remoteTarget.headers),
                       body: HttpBody.jsonUnsafe({
                         sessionID: input.sessionID,
                         seq: replaySnapshot.seq,
@@ -1015,7 +1033,7 @@ const layer = Layer.effect(
                           catch: (error) =>
                             new SessionWarpHttpError({
                               message: `Workspace steal response was invalid: ${errorData(error)}`,
-                              workspaceID,
+                              workspaceID: workspaceID!,
                               sessionID: input.sessionID,
                               status: 502,
                               body: JSON.stringify(raw),
@@ -1033,13 +1051,13 @@ const layer = Layer.effect(
                             {
                               sessionID: input.sessionID,
                               seq: replaySnapshot.seq,
-                              workspaceID,
+                              workspaceID: workspaceID!,
                             },
                           )
                         ) {
                           return yield* new SessionWarpHttpError({
                             message: "Workspace steal response did not commit the requested warp",
-                            workspaceID,
+                            workspaceID: workspaceID!,
                             sessionID: input.sessionID,
                             status: 502,
                             body: JSON.stringify(raw),
@@ -1057,7 +1075,7 @@ const layer = Layer.effect(
                 if (response.value._tag === "http-error")
                   return yield* new SessionWarpHttpError({
                     message: `Failed to steal session ${input.sessionID} into workspace ${workspaceID}: HTTP ${response.value.status} ${response.value.body}`,
-                    workspaceID,
+                    workspaceID: workspaceID!,
                     sessionID: input.sessionID,
                     status: response.value.status,
                     body: response.value.body,
@@ -1068,8 +1086,8 @@ const layer = Layer.effect(
 
               const reconciliation = yield* http
                 .execute(
-                  HttpClientRequest.post(route(target.url, "/sync/history"), {
-                    headers: new Headers(target.headers),
+                  HttpClientRequest.post(route(remoteTarget.url, "/sync/history"), {
+                    headers: new Headers(remoteTarget.headers),
                     body: HttpBody.jsonUnsafe({
                       scope: "aggregate",
                       state: { [input.sessionID]: replaySnapshot.seq },
@@ -1101,7 +1119,7 @@ const layer = Layer.effect(
                   isCommittedSessionWarp(terminal, {
                     sessionID: input.sessionID,
                     seq: replaySnapshot.seq,
-                    workspaceID,
+                    workspaceID: workspaceID!,
                   })
                 ) {
                   destinationCommitted = true
@@ -1116,7 +1134,7 @@ const layer = Layer.effect(
                 if (sessionEvents.length === 0)
                   return yield* new SessionWarpHttpError({
                     message: `Steal did not commit session ${input.sessionID}`,
-                    workspaceID,
+                    workspaceID: workspaceID!,
                     sessionID: input.sessionID,
                     status: 409,
                     body: "",
@@ -1125,13 +1143,13 @@ const layer = Layer.effect(
               destinationOutcomeUnknown = true
               return yield* new SessionWarpHttpError({
                 message: `Timed out stealing session ${input.sessionID} into workspace ${workspaceID}`,
-                workspaceID,
+                workspaceID: workspaceID!,
                 sessionID: input.sessionID,
                 status: 504,
                 body: "",
               })
             })
-            yield* events.replay(stealResult, { publish: true, ownerID: workspaceID, strictOwner: true })
+            yield* events.replay(stealResult, { publish: true, ownerID: workspaceID!, strictOwner: true })
           }),
         )
       })
