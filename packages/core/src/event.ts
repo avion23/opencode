@@ -127,6 +127,14 @@ export interface PublishOptions {
   readonly strictOwner?: boolean
 }
 
+/** Strict durable-owner fencing for a local publish: appends must come from the aggregate's current owner. */
+export interface StrictOwner {
+  readonly ownerID: string
+  readonly strictOwner: true
+}
+
+export const strictOwner = (ownerID: string): StrictOwner => ({ ownerID, strictOwner: true })
+
 export interface Interface {
   readonly publish: <D extends Definition>(
     definition: D,
@@ -364,14 +372,15 @@ export const layerWith = (options?: LayerOptions) =>
                               yield* projector(committed)
                             }
                             if (commit) yield* commit(seq)
+                            const stampedOwner = input?.ownerID ?? localOwnerID
                             yield* db
                               .insert(EventSequenceTable)
-                              .values([{ aggregate_id: aggregateID, seq, owner_id: input?.ownerID }])
+                              .values([{ aggregate_id: aggregateID, seq, owner_id: stampedOwner }])
                               .onConflictDoUpdate({
                                 target: EventSequenceTable.aggregate_id,
                                 set: {
                                   seq,
-                                  ...(input?.ownerID && row?.ownerID == null ? { owner_id: input.ownerID } : {}),
+                                  ...(stampedOwner && row?.owner_id == null ? { owner_id: stampedOwner } : {}),
                                 },
                               })
                               .run()

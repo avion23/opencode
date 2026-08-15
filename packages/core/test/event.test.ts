@@ -1107,6 +1107,81 @@ describe("EventV2", () => {
     }),
   )
 
+  it.effect("stamps the owner on the first local durable publish", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+
+      const published = yield* events.publish(
+        DurableMessage,
+        durableData(aggregateID, "local"),
+        { ...EventV2.strictOwner("owner-a") },
+      )
+      const row = yield* db
+        .select({ seq: EventSequenceTable.seq, ownerID: EventSequenceTable.owner_id })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+        .get()
+        .pipe(Effect.orDie)
+
+      expect(published.durable?.seq).toBe(0)
+      expect(row).toEqual({ seq: 0, ownerID: "owner-a" })
+    }),
+  )
+
+  it.effect("rejects a strict local publish from a different owner without advancing the sequence", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      yield* events.publish(DurableMessage, durableData(aggregateID, "owner-a"), {
+        ...EventV2.strictOwner("owner-a"),
+      })
+
+      const exit = yield* events
+        .publish(DurableMessage, durableData(aggregateID, "stale"), { ...EventV2.strictOwner("owner-b") })
+        .pipe(Effect.exit)
+      const sequence = yield* db
+        .select({ seq: EventSequenceTable.seq, ownerID: EventSequenceTable.owner_id })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+        .get()
+        .pipe(Effect.orDie)
+      const rows = yield* db
+        .select({ seq: EventTable.seq })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, aggregateID))
+        .all()
+        .pipe(Effect.orDie)
+
+      expect(String(exit)).toContain("Local owner mismatch")
+      expect(sequence).toEqual({ seq: 0, ownerID: "owner-a" })
+      expect(rows.map((row) => row.seq)).toEqual([0])
+    }),
+  )
+
+  it.effect("adopts the publishing owner for a NULL-owner legacy aggregate", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      yield* events.publish(DurableMessage, durableData(aggregateID, "legacy"))
+
+      yield* events.publish(DurableMessage, durableData(aggregateID, "adopted"), {
+        ...EventV2.strictOwner("owner-a"),
+      })
+      const row = yield* db
+        .select({ seq: EventSequenceTable.seq, ownerID: EventSequenceTable.owner_id })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+        .get()
+        .pipe(Effect.orDie)
+
+      expect(row).toEqual({ seq: 1, ownerID: "owner-a" })
+    }),
+  )
+
   it.effect("remove clears durable event sequence", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
