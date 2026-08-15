@@ -122,6 +122,12 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
           return yield* new HttpApiError.BadRequest({})
       }
 
+      // D4: only roll back a replay that the destination created itself. When
+      // the destination already had a session/sequence row before this replay,
+      // a failure (e.g. a divergent snapshot from a stale source) must not
+      // delete the legitimate destination state.
+      let hadDestinationState = Boolean(existing)
+
       const replay = events
         .exclusive(
           source,
@@ -132,14 +138,26 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
               .where(eq(EventSequenceTable.aggregate_id, source))
               .get()
               .pipe(Effect.orDie)
-            if (sequence?.ownerID && sequence.ownerID !== owner.workspaceID) return yield* new HttpApiError.Conflict({})
+            hadDestinationState ||= Boolean(sequence)
+            // D3: authorize when the recorded owner is undefined, the requesting
+            // workspace, or the transferring source's current owner (A→B→A).
+            if (
+              sequence?.ownerID &&
+              sequence.ownerID !== owner.workspaceID &&
+              sequence.ownerID !== ctx.payload.ownerID
+            )
+              return yield* new HttpApiError.Conflict({})
 
+            // Claim the aggregate before replay so a returning warp can
+            // re-adopt its own history. Reentrant-safe: this runs inside the
+            // exclusive lock for the same aggregate.
+            yield* events.claim(source, owner.workspaceID)
             return yield* events.replayAll([...ctx.payload.events], { ownerID: owner.workspaceID, strictOwner: true })
           }),
         )
         .pipe(
           Effect.catchCause((cause) =>
-            (ctx.payload.warpID
+            (ctx.payload.warpID && !hadDestinationState
               ? rollbackReplay(SessionID.make(source))
               : Effect.succeed(undefined)
             ).pipe(Effect.andThen(Effect.failCause(cause))),
@@ -189,6 +207,7 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
                 sessionID: ctx.payload.sessionID,
                 seq: ctx.payload.seq,
                 workspaceID: owner.workspaceID,
+                warpID: ctx.payload.warpID,
               })
             )
               return undefined
@@ -224,6 +243,7 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
           sessionID: ctx.payload.sessionID,
           seq: ctx.payload.seq,
           workspaceID: owner.workspaceID,
+          warpID: ctx.payload.warpID,
         })
       )
         return yield* new HttpApiError.Conflict({})

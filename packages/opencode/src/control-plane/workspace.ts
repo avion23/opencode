@@ -1,6 +1,6 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
-import { Cause, Context, Deferred, Effect, Exit, FiberMap, Layer, Option, Schedule, Schema, Stream } from "effect"
+import { Context, Effect, Exit, FiberMap, Layer, Schedule, Schema, Stream } from "effect"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { FetchHttpClient, HttpBody, HttpClient, HttpClientError, HttpClientRequest } from "effect/unstable/http"
 import { Database } from "@opencode-ai/core/database/database"
@@ -693,13 +693,6 @@ const layer = Layer.effect(
       return { seq: snapshot.latest, rows: snapshot.rows }
     })
 
-    const runDetached = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-      Effect.gen(function* () {
-        const deferred = yield* Deferred.make<A, E>()
-        yield* Effect.forkDetach(Effect.exit(effect).pipe(Effect.flatMap((exit) => Deferred.done(deferred, exit))))
-        return yield* Deferred.await(deferred)
-      })
-
     const sessionWarp = Effect.fn("Workspace.sessionWarp")(function* (input: SessionWarpInput) {
       const current = yield* db
         .select({ workspaceID: SessionTable.workspace_id, projectID: SessionTable.project_id })
@@ -737,12 +730,9 @@ const layer = Layer.effect(
       const finalOwner = workspaceID ?? current?.projectID ?? destination?.projectID
       if (!finalOwner) return
       const sourceOwner = previous?.id ?? current?.projectID ?? finalOwner
-      const warpID = EventV2.ID.create()
       let sourceFenced = false
       let destinationCommitted = false
       let destinationOutcomeUnknown = false
-      let destinationReplaySucceeded = false
-      let replaySnapshotSeq: number | undefined
       let copyApplied = false
       let sourcePatch = ""
 
@@ -802,439 +792,298 @@ const layer = Layer.effect(
         copyApplied = false
       })
 
-      const handoff = Effect.gen(function* () {
-        // Phase 1 — inside the aggregate lock: fence the source, snapshot the
-        // session, apply copy changes, and handle local/null destinations.
-        // The local projection is deliberately NOT claimed to the destination
-        // here: source writes must keep landing so phase 3's sequence
-        // re-check can detect them and abort with a conflict.
-        const prepared = yield* events.exclusive(
-          input.sessionID,
-          Effect.gen(function* () {
-            if (previous) {
-              const previousTarget = yield* WorkspaceAdapterRuntime.target(previous)
-              if (previousTarget.type === "remote") {
-                // Drain the source and fence it remotely, replaying the drained
-                // events under the source owner so local source writes still land.
-                yield* syncHistory(
-                  previous,
-                  previousTarget.url,
-                  previousTarget.headers,
-                  { scope: "aggregate", state: {}, fence: { sessionID: input.sessionID, ownerID: finalOwner } },
-                  previous.id,
-                )
-                sourceFenced = true
-              } else {
-                yield* prompt.cancel(input.sessionID)
-                yield* events.claim(input.sessionID, previous.id)
-              }
+      const handoff = events.exclusive(
+        input.sessionID,
+        Effect.gen(function* () {
+          if (previous) {
+            const previousTarget = yield* WorkspaceAdapterRuntime.target(previous)
+            if (previousTarget.type === "remote") {
+              // Fence the local projection before asking the source to drain.
+              // Both sides then reject source writes while the snapshot is read.
+              yield* events.claim(input.sessionID, finalOwner)
+              yield* syncHistory(
+                previous,
+                previousTarget.url,
+                previousTarget.headers,
+                { scope: "aggregate", state: {}, fence: { sessionID: input.sessionID, ownerID: finalOwner } },
+                finalOwner,
+              )
+              sourceFenced = true
+            } else {
+              yield* prompt.cancel(input.sessionID)
+              yield* events.claim(input.sessionID, previous.id)
             }
+          }
 
-            if (destinationTarget?.type === "remote" && current && !current.workspaceID) yield* session.touch(input.sessionID)
-            const snapshot = yield* readReplaySnapshot(input.sessionID)
-            replaySnapshotSeq = snapshot.seq
+          if (destinationTarget?.type === "remote" && current && !current.workspaceID) yield* session.touch(input.sessionID)
+          const replaySnapshot = yield* readReplaySnapshot(input.sessionID)
 
-            if (input.copyChanges && current?.workspaceID) {
-              sourcePatch = yield* runInWorkspace({
-                workspaceID: current.workspaceID,
-                local: () => vcs.diffRaw(),
-                remote: ({ target }) =>
-                  HttpClientRequest.get(route(target.url, "/vcs/diff/raw"), {
-                    headers: new Headers(target.headers),
-                  }),
-                fallback: "",
-                response: "text",
-                strict: true,
-              }).pipe(Effect.provide(AppNodeBuilderV1.build(InstanceStore.node)))
-            }
-
-            if (sourcePatch) {
-              const result = yield* runInWorkspace({
-                workspaceID: input.workspaceID ?? undefined,
-                local: () => vcs.apply({ patch: sourcePatch }),
-                remote: ({ target }) =>
-                  HttpClientRequest.post(route(target.url, "/vcs/apply"), {
-                    headers: new Headers(target.headers),
-                    body: HttpBody.jsonUnsafe({ patch: sourcePatch }),
-                  }),
-                fallback: { applied: false },
-                strict: true,
-              }).pipe(Effect.provide(AppNodeBuilderV1.build(InstanceStore.node)))
-              const applied = yield* Effect.try({
-                try: () => Schema.decodeUnknownSync(RemoteApplyResponse)(result),
-                catch: (error) =>
-                  new SyncHttpError({
-                    message: `Workspace apply response was invalid: ${errorData(error)}`,
-                    status: 502,
-                    body: JSON.stringify(result),
-                  }),
-              })
-              if (!applied.applied)
-                return yield* new Vcs.PatchApplyError({
-                  message: "Workspace target rejected the patch",
-                  reason: "not-clean",
-                })
-              copyApplied = true
-            }
-
-            if (workspaceID === null) {
-              yield* session.setWorkspace({ sessionID: input.sessionID, workspaceID: undefined })
-              yield* events.claim(input.sessionID, current?.projectID ?? finalOwner)
-              return { kind: "local" as const }
-            }
-
-            const space = destination!
-            const target = destinationTarget!
-            if (target.type === "local") {
-              yield* session
-                .setWorkspace({ sessionID: input.sessionID, workspaceID })
-                .pipe(Effect.provideService(WorkspaceRef, workspaceID))
-              yield* events.claim(input.sessionID, workspaceID)
-              return { kind: "local" as const }
-            }
-
-            return { kind: "remote" as const, replaySnapshot: snapshot }
-          }),
-        )
-        if (prepared.kind === "local") return
-        const replaySnapshot = prepared.replaySnapshot
-
-        // Phase 2 — replay the snapshot into the destination OUTSIDE the
-        // aggregate lock. Holding the lock across the replay HTTP deadlocks
-        // in-process handlers that inject source events under the same lock.
-        const replayOutcome = yield* runDetached(
-          Effect.gen(function* () {
-            const space = destination!
-            const target = destinationTarget!
-            if (target.type !== "remote")
-              return yield* new SessionWarpHttpError({
-                message: `Destination for session ${input.sessionID} is not remote`,
-                workspaceID: workspaceID!,
-                sessionID: input.sessionID,
-                status: 500,
-                body: "",
-              })
-            const remoteTarget = target
-            const response = yield* http.execute(
-              HttpClientRequest.post(route(remoteTarget.url, "/sync/replay"), {
-                headers: new Headers(remoteTarget.headers),
-                body: HttpBody.jsonUnsafe({
-                  directory: space.directory ?? "",
-                  events: replaySnapshot.rows,
-                  warpID,
-                  ownerID: finalOwner,
+          if (input.copyChanges && current?.workspaceID) {
+            sourcePatch = yield* runInWorkspace({
+              workspaceID: current.workspaceID,
+              local: () => vcs.diffRaw(),
+              remote: ({ target }) =>
+                HttpClientRequest.get(route(target.url, "/vcs/diff/raw"), {
+                  headers: new Headers(target.headers),
                 }),
-              }),
-            )
-            if (response.status < 200 || response.status >= 300) {
-              const body = yield* response.text
-              return yield* new SessionWarpHttpError({
-                message: `Failed to warp session ${input.sessionID} into workspace ${workspaceID}: HTTP ${response.status} ${body}`,
-                workspaceID: workspaceID!,
-                sessionID: input.sessionID,
-                status: response.status,
-                body,
-              })
-            }
-            const replayRaw = yield* response.json
-            const replayResult = yield* Effect.try({
-              try: () => Schema.decodeUnknownSync(RemoteReplayResponse)(replayRaw),
+              fallback: "",
+              response: "text",
+              strict: true,
+            }).pipe(Effect.provide(AppNodeBuilderV1.build(InstanceStore.node)))
+          }
+
+          if (sourcePatch) {
+            const result = yield* runInWorkspace({
+              workspaceID: input.workspaceID ?? undefined,
+              local: () => vcs.apply({ patch: sourcePatch }),
+              remote: ({ target }) =>
+                HttpClientRequest.post(route(target.url, "/vcs/apply"), {
+                  headers: new Headers(target.headers),
+                  body: HttpBody.jsonUnsafe({ patch: sourcePatch }),
+                }),
+              fallback: { applied: false },
+              strict: true,
+            }).pipe(Effect.provide(AppNodeBuilderV1.build(InstanceStore.node)))
+            const applied = yield* Effect.try({
+              try: () => Schema.decodeUnknownSync(RemoteApplyResponse)(result),
               catch: (error) =>
-                new SessionWarpHttpError({
-                  message: `Workspace replay response was invalid: ${errorData(error)}`,
-                  workspaceID: workspaceID!,
-                  sessionID: input.sessionID,
+                new SyncHttpError({
+                  message: `Workspace apply response was invalid: ${errorData(error)}`,
                   status: 502,
-                  body: JSON.stringify(replayRaw),
+                  body: JSON.stringify(result),
                 }),
             })
-            if (replayResult.sessionID !== input.sessionID)
-              return yield* new SessionWarpHttpError({
-                message: "Workspace replay response named the wrong session",
-                workspaceID: workspaceID!,
+            if (!applied.applied)
+              return yield* new Vcs.PatchApplyError({
+                message: "Workspace target rejected the patch",
+                reason: "not-clean",
+              })
+            copyApplied = true
+          }
+
+          if (workspaceID === null) {
+            yield* session.setWorkspace({ sessionID: input.sessionID, workspaceID: undefined })
+            yield* events.claim(input.sessionID, current?.projectID ?? finalOwner)
+            return
+          }
+
+          const space = destination!
+          const target = destinationTarget!
+          if (target.type === "local") {
+            yield* session
+              .setWorkspace({ sessionID: input.sessionID, workspaceID })
+              .pipe(Effect.provideService(WorkspaceRef, workspaceID))
+            yield* events.claim(input.sessionID, workspaceID)
+            return
+          }
+
+          const warpID = EventV2.ID.create()
+          const rows = replaySnapshot.rows
+          // The replay body carries the transferring source's current owner so
+          // the destination can authorize a returning warp (A→B→A) against the
+          // owner it recorded during the first leg.
+          const response = yield* http.execute(
+            HttpClientRequest.post(route(target.url, "/sync/replay"), {
+              headers: new Headers(target.headers),
+              body: HttpBody.jsonUnsafe({
+                directory: space.directory ?? "",
+                events: rows,
+                warpID,
+                ownerID: previous?.id ?? sourceOwner,
+              }),
+            }),
+          )
+          if (response.status < 200 || response.status >= 300) {
+            const body = yield* response.text
+            return yield* new SessionWarpHttpError({
+              message: `Failed to warp session ${input.sessionID} into workspace ${workspaceID}: HTTP ${response.status} ${body}`,
+              workspaceID,
+              sessionID: input.sessionID,
+              status: response.status,
+              body,
+            })
+          }
+          const replayRaw = yield* response.json
+          const replayResult = yield* Effect.try({
+            try: () => Schema.decodeUnknownSync(RemoteReplayResponse)(replayRaw),
+            catch: (error) =>
+              new SessionWarpHttpError({
+                message: `Workspace replay response was invalid: ${errorData(error)}`,
+                workspaceID,
                 sessionID: input.sessionID,
                 status: 502,
                 body: JSON.stringify(replayRaw),
-              })
-            return replayResult
-          }).pipe(
-            Effect.retry(Schedule.spaced("50 millis")),
-            Effect.interruptible,
-            Effect.timeoutOption("10 seconds"),
+              }),
+          })
+          if (replayResult.sessionID !== input.sessionID)
+            return yield* new SessionWarpHttpError({
+              message: "Workspace replay response named the wrong session",
+              workspaceID,
+              sessionID: input.sessionID,
+              status: 502,
+              body: JSON.stringify(replayRaw),
+            })
+
+          yield* events.claim(input.sessionID, workspaceID)
+          const stealResult = yield* Effect.gen(function* () {
+            const response = yield* http
+              .execute(
+                HttpClientRequest.post(route(target.url, "/sync/steal"), {
+                  headers: new Headers(target.headers),
+                  body: HttpBody.jsonUnsafe({ sessionID: input.sessionID, seq: replaySnapshot.seq, warpID, ownerID: finalOwner }),
+                }),
+              )
+              .pipe(
+                Effect.flatMap((response) =>
+                  Effect.gen(function* () {
+                    if (response.status < 200 || response.status >= 300)
+                      return {
+                        _tag: "http-error" as const,
+                        status: response.status,
+                        body: yield* response.text,
+                      }
+                    const raw = yield* response.json
+                    const body = yield* Effect.try({
+                      try: () => Schema.decodeUnknownSync(RemoteStealResponse)(raw),
+                      catch: (error) =>
+                        new SessionWarpHttpError({
+                          message: `Workspace steal response was invalid: ${errorData(error)}`,
+                          workspaceID,
+                          sessionID: input.sessionID,
+                          status: 502,
+                          body: JSON.stringify(raw),
+                        }),
+                    })
+                    if (
+                      body.sessionID !== input.sessionID ||
+                      !isCommittedSessionWarp(
+                        {
+                          id: body.event.id,
+                          aggregate_id: body.event.aggregateID,
+                          seq: body.event.seq,
+                          type: body.event.type,
+                          data: body.event.data,
+                        },
+                        {
+                          sessionID: input.sessionID,
+                          seq: replaySnapshot.seq,
+                          workspaceID,
+                          warpID,
+                        },
+                      )
+                    ) {
+                      return yield* new SessionWarpHttpError({
+                        message: "Workspace steal response did not commit the requested warp",
+                        workspaceID,
+                        sessionID: input.sessionID,
+                        status: 502,
+                        body: JSON.stringify(raw),
+                      })
+                    }
+                    return { _tag: "success" as const, event: body.event }
+                  }),
+                ),
+                Effect.retry(Schedule.spaced("50 millis")),
+                Effect.interruptible,
+                Effect.timeoutOption("10 seconds"),
+              )
+            if (response._tag === "Some") {
+              if (response.value._tag === "http-error")
+                return yield* new SessionWarpHttpError({
+                  message: `Failed to steal session ${input.sessionID} into workspace ${workspaceID}: HTTP ${response.value.status} ${response.value.body}`,
+                  workspaceID,
+                  sessionID: input.sessionID,
+                  status: response.value.status,
+                  body: response.value.body,
+                })
+              destinationCommitted = true
+              return response.value.event
+            }
+
+            const reconciliation = yield* http
+              .execute(
+                HttpClientRequest.post(route(target.url, "/sync/history"), {
+                  headers: new Headers(target.headers),
+                  body: HttpBody.jsonUnsafe({
+                    scope: "aggregate",
+                    state: { [input.sessionID]: replaySnapshot.seq },
+                  }),
+                }),
+              )
+              .pipe(
+                Effect.flatMap((response) =>
+                  Effect.gen(function* () {
+                    if (response.status < 200 || response.status >= 300) return
+                    const raw = yield* response.json
+                    return yield* Effect.try({
+                      try: () => Schema.decodeUnknownSync(Schema.Array(RemoteHistoryEvent))(raw),
+                      catch: () => undefined,
+                    })
+                  }),
+                ),
+                Effect.timeoutOption("2 seconds"),
+                Effect.catch(() => Effect.succeed(undefined)),
+              )
+            if (reconciliation?._tag === "Some" && reconciliation.value) {
+              const sessionEvents = reconciliation.value.filter(
+                (item) => item.aggregate_id === input.sessionID && item.seq > replaySnapshot.seq,
+              )
+              const terminal = sessionEvents.toSorted((a, b) => b.seq - a.seq)[0]
+              if (
+                terminal &&
+                terminal.seq === replaySnapshot.seq + 1 &&
+                isCommittedSessionWarp(terminal, {
+                  sessionID: input.sessionID,
+                  seq: replaySnapshot.seq,
+                  workspaceID,
+                  warpID,
+                })
+              ) {
+                destinationCommitted = true
+                return {
+                  id: EventV2.ID.make(terminal.id),
+                  aggregateID: terminal.aggregate_id,
+                  seq: terminal.seq,
+                  type: terminal.type,
+                  data: terminal.data,
+                }
+              }
+              if (sessionEvents.length === 0)
+                return yield* new SessionWarpHttpError({
+                  message: `Steal did not commit session ${input.sessionID}`,
+                  workspaceID,
+                  sessionID: input.sessionID,
+                  status: 409,
+                  body: "",
+                })
+            }
+            destinationOutcomeUnknown = true
+            return yield* new SessionWarpHttpError({
+              message: `Timed out stealing session ${input.sessionID} into workspace ${workspaceID}`,
+              workspaceID,
+              sessionID: input.sessionID,
+              status: 504,
+              body: "",
+            })
+          })
+          yield* events.replay(stealResult, { publish: true, ownerID: workspaceID, strictOwner: true })
+        }),
+      )
+
+      const exit = yield* Effect.uninterruptibleMask((restore) => restore(handoff).pipe(Effect.exit))
+      if (Exit.isSuccess(exit)) return exit.value
+      if (!destinationCommitted && !destinationOutcomeUnknown) {
+        const cleanup = yield* Effect.exit(
+          Effect.uninterruptible(
+            Effect.gen(function* () {
+              yield* rollbackCopy
+              if (sourceFenced) yield* restoreSource
+              else yield* events.claim(input.sessionID, sourceOwner)
+            }),
           ),
         )
-        if (replayOutcome._tag === "None")
-          return yield* new SessionWarpHttpError({
-            message: `Timed out replaying session ${input.sessionID} into workspace ${workspaceID}`,
-            workspaceID: workspaceID!,
-            sessionID: input.sessionID,
-            status: 504,
-            body: "",
-          })
-        destinationReplaySucceeded = true
-
-        // Phase 3 — back under the aggregate lock: re-check the sequence,
-        // claim the destination, steal with a bounded retry window, then
-        // reconcile or replay the committed event.
-        yield* events.exclusive(
-          input.sessionID,
-          Effect.gen(function* () {
-            const space = destination!
-            const target = destinationTarget!
-            if (target.type !== "remote")
-              return yield* new SessionWarpHttpError({
-                message: `Destination for session ${input.sessionID} is not remote`,
-                workspaceID: workspaceID!,
-                sessionID: input.sessionID,
-                status: 500,
-                body: "",
-              })
-            const remoteTarget = target
-            const latest = (yield* db
-              .select({ seq: EventSequenceTable.seq })
-              .from(EventSequenceTable)
-              .where(eq(EventSequenceTable.aggregate_id, input.sessionID))
-              .get()
-              .pipe(Effect.orDie))?.seq
-            if (latest !== replaySnapshot.seq)
-              return yield* new SessionWarpConflictError({
-                message: `Session ${input.sessionID} changed during warp: expected sequence ${replaySnapshot.seq}, found ${latest}`,
-                sessionID: input.sessionID,
-              })
-
-            yield* events.claim(input.sessionID, workspaceID!)
-
-            const stealResult = yield* Effect.gen(function* () {
-              const response = yield* runDetached(
-                http
-                  .execute(
-                    HttpClientRequest.post(route(remoteTarget.url, "/sync/steal"), {
-                      headers: new Headers(remoteTarget.headers),
-                      body: HttpBody.jsonUnsafe({
-                        sessionID: input.sessionID,
-                        seq: replaySnapshot.seq,
-                        warpID,
-                        ownerID: finalOwner,
-                      }),
-                    }),
-                  )
-                  .pipe(
-                    Effect.flatMap((response) =>
-                      Effect.gen(function* () {
-                        if (response.status < 200 || response.status >= 300)
-                          return {
-                            _tag: "http-error" as const,
-                            status: response.status,
-                            body: yield* response.text,
-                          }
-                        const raw = yield* response.json
-                        const body = yield* Effect.try({
-                          try: () => Schema.decodeUnknownSync(RemoteStealResponse)(raw),
-                          catch: (error) =>
-                            new SessionWarpHttpError({
-                              message: `Workspace steal response was invalid: ${errorData(error)}`,
-                              workspaceID: workspaceID!,
-                              sessionID: input.sessionID,
-                              status: 502,
-                              body: JSON.stringify(raw),
-                            }),
-                        })
-                        if (
-                          body.sessionID !== input.sessionID ||
-                          !isCommittedSessionWarp(
-                            {
-                              aggregate_id: body.event.aggregateID,
-                              seq: body.event.seq,
-                              type: body.event.type,
-                              data: body.event.data,
-                            },
-                            {
-                              sessionID: input.sessionID,
-                              seq: replaySnapshot.seq,
-                              workspaceID: workspaceID!,
-                            },
-                          )
-                        ) {
-                          return yield* new SessionWarpHttpError({
-                            message: "Workspace steal response did not commit the requested warp",
-                            workspaceID: workspaceID!,
-                            sessionID: input.sessionID,
-                            status: 502,
-                            body: JSON.stringify(raw),
-                          })
-                        }
-                        return { _tag: "success" as const, event: body.event }
-                      }),
-                    ),
-                    Effect.retry(Schedule.spaced("50 millis")),
-                    Effect.interruptible,
-                    Effect.timeoutOption("10 seconds"),
-                  ),
-              )
-              if (response._tag === "Some") {
-                if (response.value._tag === "http-error")
-                  return yield* new SessionWarpHttpError({
-                    message: `Failed to steal session ${input.sessionID} into workspace ${workspaceID}: HTTP ${response.value.status} ${response.value.body}`,
-                    workspaceID: workspaceID!,
-                    sessionID: input.sessionID,
-                    status: response.value.status,
-                    body: response.value.body,
-                  })
-                destinationCommitted = true
-                return response.value.event
-              }
-
-              const reconciliation = yield* http
-                .execute(
-                  HttpClientRequest.post(route(remoteTarget.url, "/sync/history"), {
-                    headers: new Headers(remoteTarget.headers),
-                    body: HttpBody.jsonUnsafe({
-                      scope: "aggregate",
-                      state: { [input.sessionID]: replaySnapshot.seq },
-                    }),
-                  }),
-                )
-                .pipe(
-                  Effect.flatMap((response) =>
-                    Effect.gen(function* () {
-                      if (response.status < 200 || response.status >= 300) return
-                      const raw = yield* response.json
-                      return yield* Effect.try({
-                        try: () => Schema.decodeUnknownSync(Schema.Array(RemoteHistoryEvent))(raw),
-                        catch: () => undefined,
-                      })
-                    }),
-                  ),
-                  Effect.timeoutOption("2 seconds"),
-                  Effect.catch(() => Effect.succeed(undefined)),
-                )
-              if (reconciliation?._tag === "Some" && reconciliation.value) {
-                const sessionEvents = reconciliation.value.filter(
-                  (item) => item.aggregate_id === input.sessionID && item.seq > replaySnapshot.seq,
-                )
-                const terminal = sessionEvents.toSorted((a, b) => b.seq - a.seq)[0]
-                if (
-                  terminal &&
-                  terminal.seq === replaySnapshot.seq + 1 &&
-                  isCommittedSessionWarp(terminal, {
-                    sessionID: input.sessionID,
-                    seq: replaySnapshot.seq,
-                    workspaceID: workspaceID!,
-                  })
-                ) {
-                  destinationCommitted = true
-                  return {
-                    id: EventV2.ID.make(terminal.id),
-                    aggregateID: terminal.aggregate_id,
-                    seq: terminal.seq,
-                    type: terminal.type,
-                    data: terminal.data,
-                  }
-                }
-                if (sessionEvents.length === 0)
-                  return yield* new SessionWarpHttpError({
-                    message: `Steal did not commit session ${input.sessionID}`,
-                    workspaceID: workspaceID!,
-                    sessionID: input.sessionID,
-                    status: 409,
-                    body: "",
-                  })
-              }
-              destinationOutcomeUnknown = true
-              return yield* new SessionWarpHttpError({
-                message: `Timed out stealing session ${input.sessionID} into workspace ${workspaceID}`,
-                workspaceID: workspaceID!,
-                sessionID: input.sessionID,
-                status: 504,
-                body: "",
-              })
-            })
-            yield* events.replay(stealResult, { publish: true, ownerID: workspaceID!, strictOwner: true })
-          }),
-        )
-      })
-
-      // Restore-semantics cascade on handoff failure: keep the destination
-      // fenced once it may have committed, restore the source only when the
-      // destination demonstrably has nothing, and fail closed otherwise.
-      // It runs on the plain-error path after the mask AND on the interrupt
-      // path via the onExit finalizer below. The finalizer is required because
-      // effect@beta.83's exitFailCause skips every post-mask continuation
-      // (including the Effect.exit capture) while an interrupt is pending in
-      // the interruptible case, so the post-mask cascade is unreachable on
-      // interrupt — the onExit finalizer is the only place that runs.
-      const restoreCascade = (exit: Exit.Failure<unknown, unknown>) =>
-        Effect.uninterruptible(
-          Effect.gen(function* () {
-            if (destinationCommitted || destinationOutcomeUnknown) return
-            const conflict = Cause.findErrorOption(exit.cause as Cause.Cause<{ _tag: string }>)
-            if (Option.isSome(conflict) && conflict.value._tag === "WorkspaceSessionWarpConflictError") {
-              yield* rollbackCopy
-              yield* events.claim(input.sessionID, previous?.id ?? sourceOwner)
-              return
-            }
-            if (destinationReplaySucceeded) return
-            if (destination && destinationTarget?.type === "remote") {
-              const history = yield* http
-                .execute(
-                  HttpClientRequest.post(route(destinationTarget.url, "/sync/history"), {
-                    headers: new Headers(destinationTarget.headers),
-                    body: HttpBody.jsonUnsafe({
-                      scope: "aggregate",
-                      state: { [input.sessionID]: replaySnapshotSeq ?? -1 },
-                    }),
-                  }),
-                )
-                .pipe(
-                  Effect.flatMap((response) =>
-                    Effect.gen(function* () {
-                      if (response.status < 200 || response.status >= 300) return undefined
-                      const raw = yield* response.json
-                      return yield* Effect.try({
-                        try: () => Schema.decodeUnknownSync(Schema.Array(RemoteHistoryEvent))(raw),
-                        catch: () => undefined,
-                      })
-                    }),
-                  ),
-                  Effect.timeoutOption("2 seconds"),
-                  Effect.catch(() => Effect.succeed(undefined)),
-                )
-              const sessionEvents = (history?._tag === "Some" ? history.value : undefined)?.filter(
-                (item) => item.aggregate_id === input.sessionID && item.seq > (replaySnapshotSeq ?? -1),
-              )
-              if (sessionEvents !== undefined && sessionEvents.length === 0) {
-                yield* rollbackCopy
-                if (sourceFenced) yield* restoreSource
-                else yield* events.claim(input.sessionID, sourceOwner)
-              }
-              return
-            }
-            yield* rollbackCopy
-            if (sourceFenced) yield* restoreSource
-            else yield* events.claim(input.sessionID, sourceOwner)
-          }),
-        )
-
-      // Exactly-once guard between the two cascade entry points: a pending
-      // interrupt can be re-delivered after the mask boundary, so both the
-      // onExit finalizer and the post-mask path can observe the same failure.
-      let restoreHandled = false
-      const exit = yield* Effect.uninterruptibleMask((restore) =>
-        restore(handoff).pipe(
-          Effect.onExit((exit) => {
-            if (Exit.isSuccess(exit) || !Exit.hasInterrupts(exit)) return Effect.void
-            if (restoreHandled) return Effect.void
-            restoreHandled = true
-            return restoreCascade(exit)
-          }),
-          Effect.exit,
-        ),
-      )
-      if (Exit.isSuccess(exit)) return exit.value
-
-      restoreHandled = true
-      const cleanupExit = yield* Effect.exit(restoreCascade(exit))
-      if (Exit.isFailure(cleanupExit)) return yield* Effect.failCause(cleanupExit.cause)
+        if (Exit.isFailure(cleanup)) return yield* Effect.failCause(cleanup.cause)
+      }
       return yield* Effect.failCause(exit.cause)
     })
 
