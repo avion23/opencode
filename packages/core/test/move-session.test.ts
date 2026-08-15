@@ -3,12 +3,13 @@ import { $ } from "bun"
 import fs from "fs/promises"
 import path from "path"
 import { eq } from "drizzle-orm"
-import { Effect } from "effect"
+import { Cause, Effect, Exit } from "effect"
 import { MoveSession } from "@opencode-ai/core/control-plane/move-session"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
+import { EventSequenceTable } from "@opencode-ai/core/event/sql"
 import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { ProjectDirectories } from "@opencode-ai/core/project/directories"
@@ -230,6 +231,111 @@ describe("MoveSession", () => {
       )
       expect(yield* Effect.promise(() => fs.readFile(path.join(source, "tracked.txt"), "utf8"))).toBe("unrelated\n")
       expect(yield* Effect.promise(() => fs.readFile(path.join(source, "untracked.txt"), "utf8"))).toBe("unrelated\n")
+    }),
+  )
+
+  it.live("writes the move under the source owner and leaves ownership for the destination claim", () =>
+    Effect.gen(function* () {
+      const root = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir()),
+        (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+      )
+      yield* Effect.promise(() => initRepo(root.path))
+      const source = abs(yield* Effect.promise(() => fs.realpath(root.path)))
+      const destination = abs(path.join(source, "packages"))
+      yield* Effect.promise(() => fs.mkdir(destination))
+
+      const projectID = (yield* Project.Service.use((service) => service.resolve(source))).id
+      const sessionID = SessionV2.ID.make("ses_move_owner")
+      const { db } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: projectID, worktree: source, sandboxes: [], time_created: 1, time_updated: 1 })
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: projectID,
+          slug: "move-owner",
+          directory: source,
+          title: "move owner",
+          version: "test",
+          time_created: 1,
+          time_updated: 1,
+        })
+        .run()
+        .pipe(Effect.orDie)
+
+      yield* MoveSession.Service.use((service) =>
+        service.moveSession({ sessionID, destination: { directory: destination }, moveChanges: false }),
+      )
+
+      // The Moved event records the destination location but must be written under
+      // the source owner, and the durable owner must NOT transition: the destination
+      // claims ownership later via events.claim after the warp lands.
+      const sequence = yield* db
+        .select({ ownerID: EventSequenceTable.owner_id, seq: EventSequenceTable.seq })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, sessionID))
+        .get()
+        .pipe(Effect.orDie)
+      expect(sequence).toEqual({ ownerID: projectID, seq: 0 })
+      expect(
+        yield* db
+          .select({ directory: SessionTable.directory, path: SessionTable.path })
+          .from(SessionTable)
+          .where(eq(SessionTable.id, sessionID))
+          .get(),
+      ).toEqual({ directory: destination, path: "packages" })
+    }),
+  )
+
+  it.live("rejects a move when the durable owner no longer matches the source owner", () =>
+    Effect.gen(function* () {
+      const root = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir()),
+        (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+      )
+      const source = abs(yield* Effect.promise(() => fs.realpath(root.path)))
+      const destination = abs(path.join(source, "packages"))
+      yield* Effect.promise(() => fs.mkdir(destination))
+
+      const projectID = (yield* Project.Service.use((service) => service.resolve(source))).id
+      const sessionID = SessionV2.ID.make("ses_move_owner_mismatch")
+      const { db } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: projectID, worktree: source, sandboxes: [], time_created: 1, time_updated: 1 })
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: projectID,
+          slug: "move-owner-mismatch",
+          directory: source,
+          title: "move owner mismatch",
+          version: "test",
+          time_created: 1,
+          time_updated: 1,
+        })
+        .run()
+        .pipe(Effect.orDie)
+      // The durable owner belongs to another coordination domain (a prior warp
+      // already claimed it elsewhere), so the source must not write a Moved event.
+      yield* db
+        .insert(EventSequenceTable)
+        .values({ aggregate_id: sessionID, seq: 0, owner_id: "ws_other" })
+        .run()
+        .pipe(Effect.orDie)
+
+      const exit = yield* MoveSession.Service.use((service) =>
+        service.moveSession({ sessionID, destination: { directory: destination }, moveChanges: false }),
+      ).pipe(Effect.exit)
+      expect(Exit.isFailure(exit) && Cause.squash(exit.cause)).toBeInstanceOf(MoveSession.SourceOwnerMismatchError)
     }),
   )
 })

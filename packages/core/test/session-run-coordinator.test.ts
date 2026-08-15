@@ -416,3 +416,67 @@ describe("SessionRunCoordinator", () => {
     ),
   )
 })
+
+  it.effect("quiesce awaits the drain exit and suppresses late wakes", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const started = yield* Deferred.make<void>()
+        const gate = yield* Deferred.make<void>()
+        let runs = 0
+        const coordinator = yield* SessionRunCoordinator.make({
+          drain: () =>
+            Effect.sync(() => ++runs).pipe(
+              Effect.andThen(Deferred.succeed(started, undefined)),
+              // Uninterruptible so quiesce cannot settle until the drain exits.
+              Effect.andThen(Effect.uninterruptible(Deferred.await(gate))),
+            ),
+        })
+
+        yield* coordinator.wake("session")
+        yield* Deferred.await(started)
+        // A late wake while quiescing must not resurrect execution.
+        yield* coordinator.wake("session")
+        const quiesce = yield* coordinator.quiesce("session").pipe(Effect.forkChild)
+        yield* Effect.yieldNow
+        // The drain is uninterruptible, so quiesce is still waiting for it.
+        expect(Array.from(yield* coordinator.active)).toEqual(["session"])
+        yield* Deferred.succeed(gate, undefined)
+        yield* Fiber.join(quiesce)
+
+        expect(runs).toBe(1)
+        expect(Array.from(yield* coordinator.active)).toEqual([])
+      }),
+    ),
+  )
+
+  it.effect("quiesce is a no-op when the key is idle", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const coordinator = yield* SessionRunCoordinator.make({ drain: () => Effect.void })
+        yield* coordinator.quiesce("session")
+        expect(Array.from(yield* coordinator.active)).toEqual([])
+      }),
+    ),
+  )
+
+  it.effect("quiesce interrupts a drain that fails mid-flight and settles cleanly", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const started = yield* Deferred.make<void>()
+        const coordinator = yield* SessionRunCoordinator.make<string, string>({
+          drain: () =>
+            Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.uninterruptible(Effect.fail("boom")))),
+        })
+        yield* coordinator.wake("session")
+        yield* Deferred.await(started)
+
+        // The drain is mid-flight when quiesce interrupts it. Effect converts the
+        // in-flight failure to interrupt-only at the uninterruptible boundary, so
+        // quiesce observes a clean stop and completes; the drain's real error is
+        // not surfaced (drain errors surface through run, not quiesce).
+        const exit = yield* coordinator.quiesce("session").pipe(Effect.exit)
+        expect(Exit.isSuccess(exit)).toBe(true)
+        expect(Array.from(yield* coordinator.active)).toEqual([])
+      }),
+    ),
+  )

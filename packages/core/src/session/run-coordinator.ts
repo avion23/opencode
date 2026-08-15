@@ -1,14 +1,6 @@
 export * as SessionRunCoordinator from "./run-coordinator"
 
-import { Cause, Deferred, Effect, Exit, Fiber, FiberSet, Schema, Scope } from "effect"
-
-/** The coordinator could not quiesce the key's active execution cleanly. */
-export class QuiesceError extends Schema.TaggedErrorClass<QuiesceError>()(
-  "SessionRunCoordinator.QuiesceError",
-  {
-    message: Schema.String,
-  },
-) {}
+import { Deferred, Effect, Exit, Fiber, FiberSet, Scope } from "effect"
 
 /** Serializes execution for each key while allowing different keys to run concurrently. */
 export interface Coordinator<Key, E> {
@@ -20,8 +12,14 @@ export interface Coordinator<Key, E> {
   readonly wake: (key: Key) => Effect.Effect<void>
   /** Stops active execution and waits for its cleanup. */
   readonly interrupt: (key: Key) => Effect.Effect<void>
-  /** Stops active execution, suppresses follow-up wakes, and waits for a clean settle. */
-  readonly quiesce: (key: Key) => Effect.Effect<void, QuiesceError>
+  /**
+   * Stops active execution, suppresses follow-up wakes, and waits for the drain
+   * to settle. The drain is interrupted, so a failure it was carrying mid-flight
+   * settles as interrupt-only and quiesce completes cleanly; a drain that already
+   * failed has left the active set and quiesce is a no-op. Drain errors surface
+   * through {@link Coordinator.run}, not through quiesce.
+   */
+  readonly quiesce: (key: Key) => Effect.Effect<void>
 }
 
 type Entry<E> = {
@@ -121,7 +119,7 @@ export const make = <Key, E>(options: {
         return Fiber.interrupt(entry.owner)
       })
 
-    const quiesce = (key: Key): Effect.Effect<void, QuiesceError> =>
+    const quiesce = (key: Key): Effect.Effect<void> =>
       Effect.suspend(() => {
         const entry = active.get(key)
         if (entry === undefined) return Effect.void
@@ -131,13 +129,11 @@ export const make = <Key, E>(options: {
           entry.pendingWake = false
         }
         const stop = entry.owner === undefined ? Effect.void : Fiber.interrupt(entry.owner)
+        // The interrupted drain settles as interrupt-only; capture its exit so a
+        // failed drain does not fail the quiesce caller.
         return stop.pipe(
           Effect.andThen(Deferred.await(entry.done).pipe(Effect.exit)),
-          Effect.flatMap((exit) =>
-            exit._tag === "Success" || (exit._tag === "Failure" && Cause.hasInterruptsOnly(exit.cause))
-              ? Effect.void
-              : new QuiesceError({ message: `Execution for ${String(key)} failed to settle while quiescing` }),
-          ),
+          Effect.asVoid,
         )
       })
 

@@ -3483,3 +3483,99 @@ describe("SessionRunnerLLM", () => {
     }),
   )
 })
+
+describe("SessionRunner ownership fencing", () => {
+  const seedPendingTool = (events: EventV2.Interface, callID: string) =>
+    Effect.gen(function* () {
+      const assistantMessageID = SessionMessage.ID.create()
+      yield* events.publish(SessionEvent.Step.Started, {
+        sessionID,
+        assistantMessageID,
+        timestamp: yield* DateTime.now,
+        agent: "build",
+        model: { id: ModelV2.ID.make("fake-model"), providerID: ProviderV2.ID.make("fake") },
+      })
+      yield* events.publish(SessionEvent.Tool.Input.Started, {
+        sessionID,
+        timestamp: yield* DateTime.now,
+        assistantMessageID,
+        callID,
+        name: "echo",
+      })
+      yield* events.publish(SessionEvent.Tool.Input.Ended, {
+        sessionID,
+        timestamp: yield* DateTime.now,
+        assistantMessageID,
+        callID,
+        text: '{"text":"stale"}',
+      })
+      yield* events.publish(SessionEvent.Tool.Called, {
+        sessionID,
+        timestamp: yield* DateTime.now,
+        assistantMessageID,
+        callID,
+        tool: "echo",
+        input: { text: "stale" },
+        provider: { executed: false },
+      })
+    })
+
+  it.effect("a stale runner at an old location interrupts cleanly without appending", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "stale drain" }), resume: false })
+      yield* SessionInput.promoteSteers(db, events, sessionID, Number.MAX_SAFE_INTEGER, EventV2.strictOwner(Project.ID.global))
+      yield* seedPendingTool(events, "call-stale-location")
+
+      // The session moved away from this runner's ambient location. The drain must
+      // interrupt before failing interrupted tools: failInterruptedTools runs before
+      // the turn loop, so it cannot rely on runTurnAttempt's location check.
+      yield* db
+        .update(SessionTable)
+        .set({ directory: "/other" })
+        .where(eq(SessionTable.id, sessionID))
+        .run()
+        .pipe(Effect.orDie)
+      const before = yield* EventV2.latestSequence(db, sessionID)
+      const runner = yield* SessionRunner.Service
+      const exit = yield* runner.run({ sessionID, force: true }).pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+      expect(yield* EventV2.latestSequence(db, sessionID)).toBe(before)
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "user", text: "stale drain" },
+        { type: "assistant", content: [{ type: "tool", id: "call-stale-location", state: { status: "running" } }] },
+      ])
+    }),
+  )
+
+  it.effect("a runner whose durable owner moved elsewhere interrupts instead of appending", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "fenced drain" }), resume: false })
+      yield* SessionInput.promoteSteers(db, events, sessionID, Number.MAX_SAFE_INTEGER, EventV2.strictOwner(Project.ID.global))
+      yield* seedPendingTool(events, "call-owner-fence")
+
+      // The durable owner now belongs to another coordination domain while the
+      // session record still matches this runner's location. The Tool.Failed append
+      // dies with OwnerFenceError and run() converts it to a clean interrupt.
+      yield* events.claim(sessionID, "remote-owner")
+      const before = yield* EventV2.latestSequence(db, sessionID)
+      const runner = yield* SessionRunner.Service
+      const exit = yield* runner.run({ sessionID, force: true }).pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+      expect(yield* EventV2.latestSequence(db, sessionID)).toBe(before)
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "user", text: "fenced drain" },
+        { type: "assistant", content: [{ type: "tool", id: "call-owner-fence", state: { status: "running" } }] },
+      ])
+    }),
+  )
+})

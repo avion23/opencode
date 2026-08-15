@@ -3,7 +3,6 @@ export * as SessionExecution from "./execution"
 import { Context, Effect, Layer } from "effect"
 import { LayerNode } from "../effect/layer-node"
 import { Node } from "../effect/app-node"
-import { SessionRunCoordinator } from "./run-coordinator"
 import { SessionRunner } from "./runner/index"
 import { SessionSchema } from "./schema"
 
@@ -20,7 +19,7 @@ export interface Interface {
    * Stops active work, suppresses follow-up wakes, and waits for a clean settle.
    * Used when ownership of the Session moves so the old location drains to idle.
    */
-  readonly quiesce: (sessionID: SessionSchema.ID) => Effect.Effect<void, SessionRunCoordinator.QuiesceError>
+  readonly quiesce: (sessionID: SessionSchema.ID) => Effect.Effect<void>
 }
 
 /** Routes execution from a Session ID to the runner owned by that Session's Location. */
