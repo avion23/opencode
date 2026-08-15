@@ -1216,8 +1216,169 @@ describe("EventV2", () => {
         )
         .pipe(Effect.exit)
 
-      expect(String(replay)).toContain("Replay diverged")
+      // F3: a replay within the removed aggregate's consumed range is a silent
+      // idempotent no-op — it neither dies nor resurrects the aggregate.
+      expect(Exit.isSuccess(replay)).toBe(true)
       expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).all()).toEqual([])
+      expect(
+        yield* db
+          .select({ seq: EventSequenceTable.seq, ownerID: EventSequenceTable.owner_id })
+          .from(EventSequenceTable)
+          .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+          .get()
+          .pipe(Effect.orDie),
+      ).toEqual({ seq: 1, ownerID: owner.ownerID })
+    }),
+  )
+
+  it.effect("rejects a replay beyond the tombstone sequence after owned removal", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      const owner = EventV2.strictOwner("owner-a")
+
+      yield* events.publish(DurableMessage, durableData(aggregateID, "first"), owner)
+      yield* events.publish(DurableMessage, durableData(aggregateID, "second"), owner)
+      yield* events.remove(aggregateID, owner)
+
+      // F2: a stale replay landing at exactly latest + 1 (2) would previously
+      // pass the sequence check and resurrect the aggregate — it must be
+      // rejected outright.
+      const replay = yield* events
+        .replay(
+          {
+            id: EventV2.ID.create(),
+            type: EventV2.versionedType(DurableMessage.type, 1),
+            seq: 2,
+            aggregateID,
+            data: durableData(aggregateID, "resurrect"),
+          },
+          { ...owner },
+        )
+        .pipe(Effect.exit)
+
+      expect(String(replay)).toContain("Replay fenced")
+      expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).all()).toEqual([])
+      expect(
+        yield* db
+          .select({ seq: EventSequenceTable.seq })
+          .from(EventSequenceTable)
+          .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+          .get()
+          .pipe(Effect.orDie),
+      ).toEqual({ seq: 1 })
+    }),
+  )
+
+  it.effect("re-delivering the exact last event after owned removal is a silent no-op", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      const owner = EventV2.strictOwner("owner-a")
+      const received = new Array<EventV2.Payload>()
+
+      const first = yield* events.publish(DurableMessage, durableData(aggregateID, "first"), owner)
+      const last = yield* events.publish(DurableMessage, durableData(aggregateID, "second"), owner)
+      yield* events.listen((event) => Effect.sync(() => received.push(event)))
+      yield* events.remove(aggregateID, owner)
+
+      // At-least-once delivery: a warp retry re-delivers the exact last event
+      // (same id/seq/data). The idempotency fast path needs the stored row that
+      // the tombstone deleted, so it must no-op instead of dying.
+      const replay = yield* events
+        .replay(
+          {
+            id: last.id,
+            type: EventV2.versionedType(DurableMessage.type, 1),
+            seq: last.durable!.seq,
+            aggregateID,
+            data: last.data,
+          },
+          { ...owner, publish: true },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isSuccess(replay)).toBe(true)
+      expect(received).toEqual([])
+      expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).all()).toEqual([])
+      expect(
+        yield* db
+          .select({ seq: EventSequenceTable.seq, ownerID: EventSequenceTable.owner_id })
+          .from(EventSequenceTable)
+          .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+          .get()
+          .pipe(Effect.orDie),
+      ).toEqual({ seq: 1, ownerID: owner.ownerID })
+      expect(first.id).not.toBe(last.id)
+    }),
+  )
+
+  it.effect("latestSequence reports no events for a fenced-removal aggregate", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      const owner = EventV2.strictOwner("owner-a")
+
+      yield* events.publish(DurableMessage, durableData(aggregateID, "first"), owner)
+      yield* events.publish(DurableMessage, durableData(aggregateID, "second"), owner)
+      expect(yield* EventV2.latestSequence(db, aggregateID)).toBe(1)
+      expect(yield* EventV2.hasEvents(db, aggregateID)).toBe(true)
+
+      yield* events.remove(aggregateID, owner)
+
+      // F4: consumers must not observe a phantom sequence for a tombstoned
+      // aggregate — the fence seq row stays for owner fencing, but the
+      // replayable sequence is -1 (no events).
+      expect(yield* EventV2.hasEvents(db, aggregateID)).toBe(false)
+      expect(yield* EventV2.latestSequence(db, aggregateID)).toBe(-1)
+      expect(
+        yield* db
+          .select({ seq: EventSequenceTable.seq })
+          .from(EventSequenceTable)
+          .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+          .get()
+          .pipe(Effect.orDie),
+      ).toEqual({ seq: 1 })
+    }),
+  )
+
+  it.effect("remove is uninterruptible once its transaction starts", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      yield* events.publish(DurableMessage, durableData(aggregateID, "seed"))
+
+      // Hold the aggregate lock so the removal is queued and demonstrably
+      // started when it is released. The removal's exclusive transaction then
+      // runs to completion under Effect.uninterruptible: an interrupt sent
+      // afterwards is deferred and the removal still succeeds.
+      const lockHeld = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const holder = yield* events
+        .exclusive(aggregateID, Deferred.succeed(lockHeld, undefined).pipe(Effect.andThen(Deferred.await(release))))
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(lockHeld)
+
+      const removal = yield* events.remove(aggregateID).pipe(Effect.forkChild)
+      yield* Effect.yieldNow
+      expect(yield* Deferred.isDone(lockHeld)).toBe(true)
+
+      yield* Deferred.succeed(release, undefined)
+      yield* Effect.yieldNow
+      yield* Effect.yieldNow
+      yield* Fiber.interrupt(removal)
+      const exit = yield* Fiber.join(removal).pipe(Effect.exit)
+      yield* Fiber.join(holder)
+
+      expect(Exit.isSuccess(exit)).toBe(true)
+      expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).all()).toEqual([])
+      expect(
+        yield* db.select().from(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, aggregateID)).get(),
+      ).toBe(undefined)
     }),
   )
 
@@ -1311,7 +1472,9 @@ describe("EventV2", () => {
         )
         .pipe(Effect.exit)
 
-      expect(String(replay)).toContain("Replay diverged")
+      // F3: the consumed-range replay is a silent no-op — it does not publish
+      // and inserts nothing.
+      expect(Exit.isSuccess(replay)).toBe(true)
       expect(received).toEqual([])
       expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).all()).toEqual([])
     }),
