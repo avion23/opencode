@@ -48,6 +48,22 @@ export class InvalidDurableEventError extends Schema.TaggedErrorClass<InvalidDur
   },
 ) {}
 
+/**
+ * Durable-owner fence violation: a local append or strict replay came from a
+ * different owner than the aggregate's recorded durable owner.
+ *
+ * This is a distinct defect tag from {@link InvalidDurableEventError} so callers can
+ * convert owner fences (a stale location after a move) to an interrupt at a single
+ * drain boundary without masking genuine sequence-divergence or duplicate-ID bugs.
+ */
+export class OwnerFenceError extends Schema.TaggedErrorClass<OwnerFenceError>()(
+  "EventV2.OwnerFence",
+  {
+    type: Schema.String,
+    message: Schema.String,
+  },
+) {}
+
 const decodeSerializedEvent = (event: SerializedEvent): Payload => {
   const definition = Durable.get(event.type)
   if (!definition?.durable) {
@@ -278,31 +294,43 @@ export const layerWith = (options?: LayerOptions) =>
                               .get()
                               .pipe(Effect.orDie)
                             const latest = row?.seq ?? -1
-                            if (
-                              !input &&
-                              strictLocalOwner &&
-                              localOwnerID &&
-                              row?.ownerID &&
-                              row.ownerID !== localOwnerID
-                            ) {
-                              yield* Effect.die(
-                                new InvalidDurableEventError({
-                                  type: event.type,
-                                  message: `Local owner mismatch for aggregate ${aggregateID}: expected ${row.ownerID}, got ${localOwnerID}`,
-                                }),
-                              )
+                            if (!input && strictLocalOwner) {
+                              if (localOwnerID === undefined)
+                                yield* Effect.die(
+                                  new OwnerFenceError({
+                                    type: event.type,
+                                    message: `Local strict owner requires ownerID for aggregate ${aggregateID}`,
+                                  }),
+                                )
+                              if (row?.ownerID && row.ownerID !== localOwnerID) {
+                                yield* Effect.die(
+                                  new OwnerFenceError({
+                                    type: event.type,
+                                    message: `Local owner mismatch for aggregate ${aggregateID}: expected ${row.ownerID}, got ${localOwnerID}`,
+                                  }),
+                                )
+                              }
                             }
                             const encoded = Schema.encodeUnknownSync(definition.data)(event.data) as Record<
                               string,
                               unknown
                             >
-                            if (input?.strictOwner && row?.ownerID && row.ownerID !== input.ownerID) {
-                              yield* Effect.die(
-                                new InvalidDurableEventError({
-                                  type: event.type,
-                                  message: `Replay owner mismatch for aggregate ${aggregateID}: expected ${row.ownerID}, got ${input.ownerID ?? "none"}`,
-                                }),
-                              )
+                            if (input?.strictOwner) {
+                              if (input.ownerID === undefined)
+                                yield* Effect.die(
+                                  new OwnerFenceError({
+                                    type: event.type,
+                                    message: `Replay strict owner requires ownerID for aggregate ${aggregateID}`,
+                                  }),
+                                )
+                              if (row?.ownerID && row.ownerID !== input.ownerID) {
+                                yield* Effect.die(
+                                  new OwnerFenceError({
+                                    type: event.type,
+                                    message: `Replay owner mismatch for aggregate ${aggregateID}: expected ${row.ownerID}, got ${input.ownerID}`,
+                                  }),
+                                )
+                              }
                             }
                             if (input && input.seq <= latest) {
                               const stored = yield* db
@@ -380,7 +408,7 @@ export const layerWith = (options?: LayerOptions) =>
                                 target: EventSequenceTable.aggregate_id,
                                 set: {
                                   seq,
-                                  ...(stampedOwner && row?.owner_id == null ? { owner_id: stampedOwner } : {}),
+                                  ...(stampedOwner && row?.ownerID == null ? { owner_id: stampedOwner } : {}),
                                 },
                               })
                               .run()

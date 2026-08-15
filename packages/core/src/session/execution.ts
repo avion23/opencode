@@ -3,6 +3,7 @@ export * as SessionExecution from "./execution"
 import { Context, Effect, Layer } from "effect"
 import { LayerNode } from "../effect/layer-node"
 import { Node } from "../effect/app-node"
+import { SessionRunCoordinator } from "./run-coordinator"
 import { SessionRunner } from "./runner/index"
 import { SessionSchema } from "./schema"
 
@@ -15,6 +16,11 @@ export interface Interface {
   readonly wake: (sessionID: SessionSchema.ID) => Effect.Effect<void>
   /** Interrupt active work owned by this process. Idle interruption is a no-op. */
   readonly interrupt: (sessionID: SessionSchema.ID) => Effect.Effect<void>
+  /**
+   * Stops active work, suppresses follow-up wakes, and waits for a clean settle.
+   * Used when ownership of the Session moves so the old location drains to idle.
+   */
+  readonly quiesce: (sessionID: SessionSchema.ID) => Effect.Effect<void, SessionRunCoordinator.QuiesceError>
 }
 
 /** Routes execution from a Session ID to the runner owned by that Session's Location. */
@@ -30,5 +36,6 @@ export const noopLayer = Layer.succeed(
     resume: () => Effect.void,
     wake: () => Effect.void,
     interrupt: () => Effect.void,
+    quiesce: () => Effect.void,
   }),
 )

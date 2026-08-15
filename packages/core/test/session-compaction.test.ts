@@ -103,6 +103,7 @@ test("compaction invokes the provider when an oversized newest message has a bou
         }),
       }),
     ],
+    owner: () => Effect.succeed(EventV2.strictOwner("compaction-test")),
   })
 
   const result = Effect.runSync(

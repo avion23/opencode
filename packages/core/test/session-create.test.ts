@@ -197,7 +197,7 @@ describe("SessionV2.create", () => {
       const { db } = yield* Database.Service
       const created = yield* session.create({ location })
       yield* session.prompt({ sessionID: created.id, prompt: Prompt.make({ text: "Hello" }), resume: false })
-      yield* SessionInput.promoteSteers(db, events, created.id, Number.MAX_SAFE_INTEGER)
+      yield* SessionInput.promoteSteers(db, events, created.id, Number.MAX_SAFE_INTEGER, EventV2.strictOwner(ProjectV2.ID.global))
 
       expect(
         Array.from(yield* session.events({ sessionID: created.id }).pipe(Stream.take(2), Stream.runCollect)),
@@ -219,7 +219,7 @@ describe("SessionV2.create", () => {
         prompt: Prompt.make({ text: "Replay lifecycle" }),
         resume: false,
       })
-      yield* SessionInput.promoteSteers(sourceDb, sourceEvents, created.id, Number.MAX_SAFE_INTEGER)
+      yield* SessionInput.promoteSteers(sourceDb, sourceEvents, created.id, Number.MAX_SAFE_INTEGER, EventV2.strictOwner(ProjectV2.ID.global))
       const serialized = (yield* sourceDb
         .select()
         .from(EventTable)

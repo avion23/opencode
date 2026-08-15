@@ -40,6 +40,7 @@ const execution = Layer.succeed(
       Effect.sync(() => {
         wakeCalls.push(sessionID)
       }),
+    quiesce: () => Effect.void,
   }),
 )
 const it = testEffect(
@@ -194,7 +195,7 @@ describe("SessionV2.prompt", () => {
 
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "First" }), resume: false })
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Second" }), resume: false })
-      yield* SessionInput.promoteSteers(db, events, sessionID, Number.MAX_SAFE_INTEGER)
+      yield* SessionInput.promoteSteers(db, events, sessionID, Number.MAX_SAFE_INTEGER, EventV2.strictOwner(Project.ID.global))
       const streamed = Array.from(yield* Fiber.join(fiber))
 
       expect(streamed.map((event) => [event.durable?.seq, event.type])).toEqual([
@@ -369,8 +370,8 @@ describe("SessionV2.prompt", () => {
 
       yield* Effect.all(
         [
-          SessionInput.promoteSteers(db, events, sessionID, Number.MAX_SAFE_INTEGER),
-          SessionInput.promoteSteers(db, events, sessionID, Number.MAX_SAFE_INTEGER),
+          SessionInput.promoteSteers(db, events, sessionID, Number.MAX_SAFE_INTEGER, EventV2.strictOwner(Project.ID.global)),
+          SessionInput.promoteSteers(db, events, sessionID, Number.MAX_SAFE_INTEGER, EventV2.strictOwner(Project.ID.global)),
         ],
         { concurrency: "unbounded" },
       )
@@ -393,7 +394,7 @@ describe("SessionV2.prompt", () => {
       const cutoff = first.admittedSeq
       const second = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "After cutoff" }), resume: false })
 
-      yield* SessionInput.promoteSteers(db, events, sessionID, cutoff)
+      yield* SessionInput.promoteSteers(db, events, sessionID, cutoff, EventV2.strictOwner(Project.ID.global))
 
       expect(yield* admitted(first.id)).toHaveProperty("promotedSeq")
       expect(yield* admitted(second.id)).not.toHaveProperty("promotedSeq")

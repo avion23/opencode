@@ -82,8 +82,11 @@ export const admit = Effect.fn("SessionInput.admit")(function* (
       ),
       Effect.catchDefect((defect) =>
         // An owner mismatch must stay a defect: swallowing it as an already-admitted
-        // prompt would let a stale location adopt another owner's admission.
-        defect instanceof EventV2.InvalidDurableEventError
+        // prompt would let a stale location adopt another owner's admission. Only
+        // the dedicated fence tag is treated specially (converted to an interrupt
+        // at the runner's drain boundary); other durable errors keep the idempotent
+        // store re-read so genuine duplicates resolve without masking bugs.
+        defect instanceof EventV2.OwnerFenceError
           ? Effect.die(defect)
           : find(db, input.id).pipe(
               Effect.flatMap((stored) => (stored ? Effect.succeed(stored) : Effect.die(defect))),

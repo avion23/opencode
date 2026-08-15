@@ -284,6 +284,7 @@ describe("SessionProjector", () => {
         sessionID,
         prompt: Prompt.make({ text: "promote me" }),
         delivery: "steer",
+        owner: EventV2.strictOwner(Project.ID.global),
       })
       if (!admitted) return yield* Effect.die("Prompt admission failed")
 
