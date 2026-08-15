@@ -6,6 +6,7 @@ import { BackgroundJob } from "@/background/job"
 import { Effect, Latch, Layer, Scope, Context } from "effect"
 import { Session } from "./session"
 import { SessionID } from "./schema"
+import { NotFoundError } from "@/storage/storage"
 import { SessionStatus } from "./status"
 
 export interface Interface {
@@ -13,15 +14,15 @@ export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly ensureRunning: (
     sessionID: SessionID,
-    onInterrupt: Effect.Effect<SessionV1.WithParts>,
-    work: Effect.Effect<SessionV1.WithParts>,
-  ) => Effect.Effect<SessionV1.WithParts>
+    onInterrupt: Effect.Effect<SessionV1.WithParts, NotFoundError>,
+    work: Effect.Effect<SessionV1.WithParts, NotFoundError>,
+  ) => Effect.Effect<SessionV1.WithParts, NotFoundError>
   readonly startShell: (
     sessionID: SessionID,
-    onInterrupt: Effect.Effect<SessionV1.WithParts>,
-    work: Effect.Effect<SessionV1.WithParts>,
+    onInterrupt: Effect.Effect<SessionV1.WithParts, NotFoundError>,
+    work: Effect.Effect<SessionV1.WithParts, NotFoundError>,
     ready?: Latch.Latch,
-  ) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
+  ) => Effect.Effect<SessionV1.WithParts, Session.BusyError | NotFoundError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionRunState") {}
@@ -35,7 +36,7 @@ const layer = Layer.effect(
     const state = yield* InstanceState.make(
       Effect.fn("SessionRunState.state")(function* () {
         const scope = yield* Scope.Scope
-        const runners = new Map<SessionID, Runner.Runner<SessionV1.WithParts>>()
+        const runners = new Map<SessionID, Runner.Runner<SessionV1.WithParts, NotFoundError>>()
         yield* Effect.addFinalizer(
           Effect.fnUntraced(function* () {
             yield* Effect.forEach(runners.values(), (runner) => runner.cancel, {
@@ -51,12 +52,12 @@ const layer = Layer.effect(
 
     const runner = Effect.fn("SessionRunState.runner")(function* (
       sessionID: SessionID,
-      onInterrupt: Effect.Effect<SessionV1.WithParts>,
+      onInterrupt: Effect.Effect<SessionV1.WithParts, NotFoundError>,
     ) {
       const data = yield* InstanceState.get(state)
       const existing = data.runners.get(sessionID)
       if (existing) return existing
-      const next = Runner.make<SessionV1.WithParts>(data.scope, {
+      const next = Runner.make<SessionV1.WithParts, NotFoundError>(data.scope, {
         onIdle: Effect.gen(function* () {
           data.runners.delete(sessionID)
           yield* status.set(sessionID, { type: "idle" })
@@ -87,16 +88,16 @@ const layer = Layer.effect(
 
     const ensureRunning = Effect.fn("SessionRunState.ensureRunning")(function* (
       sessionID: SessionID,
-      onInterrupt: Effect.Effect<SessionV1.WithParts>,
-      work: Effect.Effect<SessionV1.WithParts>,
+      onInterrupt: Effect.Effect<SessionV1.WithParts, NotFoundError>,
+      work: Effect.Effect<SessionV1.WithParts, NotFoundError>,
     ) {
       return yield* (yield* runner(sessionID, onInterrupt)).ensureRunning(work)
     })
 
     const startShell = Effect.fn("SessionRunState.startShell")(function* (
       sessionID: SessionID,
-      onInterrupt: Effect.Effect<SessionV1.WithParts>,
-      work: Effect.Effect<SessionV1.WithParts>,
+      onInterrupt: Effect.Effect<SessionV1.WithParts, NotFoundError>,
+      work: Effect.Effect<SessionV1.WithParts, NotFoundError>,
       ready?: Latch.Latch,
     ) {
       return yield* (yield* runner(sessionID, onInterrupt))

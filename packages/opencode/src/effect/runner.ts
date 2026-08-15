@@ -1,4 +1,4 @@
-import { Cause, Deferred, Effect, Exit, Fiber, Latch, Schema, Scope, SynchronizedRef } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Latch, Ref, Schema, Scope, SynchronizedRef } from "effect"
 
 export interface Runner<A, E = never> {
   readonly state: State<A, E>
@@ -11,20 +11,32 @@ export interface Runner<A, E = never> {
 export class Cancelled extends Schema.TaggedErrorClass<Cancelled>()("RunnerCancelled", {}) {}
 export class Busy extends Schema.TaggedErrorClass<Busy>()("RunnerBusy", {}) {}
 
-interface RunHandle<A, E> {
+/**
+ * Tracks callers that are waiting on a run/shell so `cancel` can wait for
+ * their `onInterrupt` cleanup to finish before the runner reports idle.
+ * Interrupt cleanup (e.g. finalizing an assistant message or processor
+ * cleanup) can publish session events; a concurrent session removal must not
+ * race it.
+ */
+interface CallerTracking {
+  waiters: Ref.Ref<number>
+  settled: Deferred.Deferred<void>
+}
+
+interface RunHandle<A, E> extends CallerTracking {
   id: number
   done: Deferred.Deferred<A, E | Cancelled>
   fiber: Fiber.Fiber<A, E>
 }
 
-interface ShellHandle<A, E> {
+interface ShellHandle<A, E> extends CallerTracking {
   id: number
   cancelled: Deferred.Deferred<void>
   ready?: Latch.Latch
   fiber: Fiber.Fiber<A, E>
 }
 
-interface PendingHandle<A, E> {
+interface PendingHandle<A, E> extends CallerTracking {
   id: number
   done: Deferred.Deferred<A, E | Cancelled>
   work: Effect.Effect<A, E>
@@ -56,13 +68,34 @@ export const make = <A, E = never>(
     return ids
   }
 
+  const makeTracking = () =>
+    Effect.gen(function* () {
+      const waiters = yield* Ref.make(0)
+      const settled = yield* Deferred.make<void>()
+      return { waiters, settled } satisfies CallerTracking
+    })
+
+  const registerCaller = (tracking: CallerTracking) => Ref.update(tracking.waiters, (n) => n + 1)
+
+  const callerDone = (tracking: CallerTracking) =>
+    Effect.gen(function* () {
+      const remaining = yield* Ref.updateAndGet(tracking.waiters, (n) => n - 1)
+      if (remaining === 0) yield* Deferred.succeed(tracking.settled, undefined).pipe(Effect.asVoid)
+    })
+
+  const awaitCallers = (tracking: CallerTracking) => Deferred.await(tracking.settled)
+
   const complete = (done: Deferred.Deferred<A, E | Cancelled>, exit: Exit.Exit<A, E>) =>
     Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)
       ? Deferred.fail(done, new Cancelled()).pipe(Effect.asVoid)
       : Deferred.done(done, exit).pipe(Effect.asVoid)
 
-  const awaitDone = (done: Deferred.Deferred<A, E | Cancelled>) =>
-    Deferred.await(done).pipe(Effect.catchTag("RunnerCancelled", (e) => onInterrupt ?? Effect.die(e)))
+  const awaitDone = (done: Deferred.Deferred<A, E | Cancelled>, tracking: CallerTracking) =>
+    Deferred.await(done)
+      .pipe(
+        Effect.catchTag("RunnerCancelled", (e) => onInterrupt ?? Effect.die(e)),
+        Effect.ensuring(callerDone(tracking)),
+      )
 
   const idleIfCurrent = () =>
     SynchronizedRef.modify(ref, (st) => [st._tag === "Idle" ? idle : Effect.void, st] as const).pipe(Effect.flatten)
@@ -80,14 +113,15 @@ export const make = <A, E = never>(
         ] as const,
     ).pipe(Effect.flatten)
 
-  const startRun = (work: Effect.Effect<A, E>, done: Deferred.Deferred<A, E | Cancelled>) =>
+  const startRun = (work: Effect.Effect<A, E>, done: Deferred.Deferred<A, E | Cancelled>, tracking?: CallerTracking) =>
     Effect.gen(function* () {
       const id = next()
       const fiber = yield* work.pipe(
         Effect.onExit((exit) => finishRun(id, done, exit)),
         Effect.forkIn(scope),
       )
-      return { id, done, fiber } satisfies RunHandle<A, E>
+      const track = tracking ?? (yield* makeTracking())
+      return { id, done, fiber, waiters: track.waiters, settled: track.settled } satisfies RunHandle<A, E>
     })
 
   const finishShell = (id: number) =>
@@ -98,7 +132,9 @@ export const make = <A, E = never>(
           return [idle, { _tag: "Idle" }] as const
         }
         if (st._tag === "ShellThenRun" && st.shell.id === id) {
-          const run = yield* startRun(st.run.work, st.run.done)
+          // Adopt the pending run's caller tracking: the callers awaiting the
+          // pending done are the same callers that await the started run.
+          const run = yield* startRun(st.run.work, st.run.done, st.run)
           return [Effect.void, { _tag: "Running", run }] as const
         }
         return [Effect.void, st] as const
@@ -119,19 +155,23 @@ export const make = <A, E = never>(
         switch (st._tag) {
           case "Running":
           case "ShellThenRun":
-            return [awaitDone(st.run.done), st] as const
+            yield* registerCaller(st.run)
+            return [awaitDone(st.run.done, st.run), st] as const
           case "Shell": {
             const run = {
               id: next(),
               done: yield* Deferred.make<A, E | Cancelled>(),
               work,
+              ...(yield* makeTracking()),
             } satisfies PendingHandle<A, E>
-            return [awaitDone(run.done), { _tag: "ShellThenRun", shell: st.shell, run }] as const
+            yield* registerCaller(run)
+            return [awaitDone(run.done, run), { _tag: "ShellThenRun", shell: st.shell, run }] as const
           }
           case "Idle": {
             const done = yield* Deferred.make<A, E | Cancelled>()
             const run = yield* startRun(work, done)
-            return [awaitDone(done), { _tag: "Running", run }] as const
+            yield* registerCaller(run)
+            return [awaitDone(done, run), { _tag: "Running", run }] as const
           }
         }
       }),
@@ -149,7 +189,14 @@ export const make = <A, E = never>(
         const id = next()
         const cancelled = yield* Deferred.make<void>()
         const fiber = yield* work.pipe(Effect.ensuring(finishShell(id)), Effect.forkChild)
-        const shell = { id, cancelled, ready, fiber } satisfies ShellHandle<A, E>
+        const shell = {
+          id,
+          cancelled,
+          ready,
+          fiber,
+          ...(yield* makeTracking()),
+        } satisfies ShellHandle<A, E>
+        yield* registerCaller(shell)
         return [
           Effect.gen(function* () {
             const exit = yield* Fiber.await(fiber)
@@ -162,7 +209,7 @@ export const make = <A, E = never>(
               return yield* Effect.die(new Cancelled())
             }
             return yield* Effect.failCause(exit.cause)
-          }),
+          }).pipe(Effect.ensuring(callerDone(shell))),
           { _tag: "Shell", shell },
         ] as const
       }),
@@ -177,6 +224,10 @@ export const make = <A, E = never>(
           Effect.gen(function* () {
             yield* Fiber.interrupt(st.run.fiber)
             yield* Deferred.fail(st.run.done, new Cancelled()).pipe(Effect.asVoid)
+            // Wait for waiting callers to finish their onInterrupt cleanup:
+            // it can publish session events, and a concurrent session removal
+            // must not race it.
+            yield* awaitCallers(st.run)
             yield* idleIfCurrent()
           }),
           { _tag: "Idle" } as const,
@@ -185,6 +236,7 @@ export const make = <A, E = never>(
         return [
           Effect.gen(function* () {
             yield* stopShell(st.shell)
+            yield* awaitCallers(st.shell)
             yield* idleIfCurrent()
           }),
           { _tag: "Idle" } as const,
@@ -194,6 +246,8 @@ export const make = <A, E = never>(
           Effect.gen(function* () {
             yield* stopShell(st.shell)
             yield* Deferred.fail(st.run.done, new Cancelled()).pipe(Effect.asVoid)
+            yield* awaitCallers(st.run)
+            yield* awaitCallers(st.shell)
             yield* idleIfCurrent()
           }),
           { _tag: "Idle" } as const,

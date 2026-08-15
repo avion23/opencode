@@ -77,7 +77,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             time: match.state.status === "running" ? match.state.time : { start: Date.now() },
           },
         }
-      }),
+      }).pipe(Effect.asVoid, Effect.catchTag("NotFoundError", () => Effect.void)),
     ask: (req) =>
       permission
         .ask({

@@ -2,9 +2,14 @@ import { describe, expect } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { EventV2 } from "@opencode-ai/core/event"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { Deferred, Effect, Exit, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
+import { eq } from "drizzle-orm"
+import { Database } from "@opencode-ai/core/database/database"
+import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
+import { PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
+import { SessionRunState } from "../../src/session/run-state"
 import { MessageID, PartID, type SessionID } from "../../src/session/schema"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { provideInstance, tmpdirScoped } from "../fixture/fixture"
@@ -16,6 +21,7 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { InstanceStore } from "@/project/instance-store"
 import { InstanceBootstrap } from "@/project/bootstrap"
+import { NotFoundError } from "@/storage/storage"
 
 const it = testEffect(
   AppNodeBuilder.build(
@@ -25,6 +31,8 @@ const it = testEffect(
       SessionProjector.node,
       CrossSpawnSpawner.node,
       InstanceStore.node,
+      Database.node,
+      SessionRunState.node,
     ]),
     [
       [RuntimeFlags.node, RuntimeFlags.layer({ experimentalWorkspaces: false })],
@@ -43,6 +51,46 @@ const awaitDeferred = <T>(deferred: Deferred.Deferred<T>, message: string) =>
   )
 
 const remove = (id: SessionID) => SessionNs.use.remove(id)
+
+const sessionSequenceRow = (sessionID: SessionID) =>
+  Database.Service.use(({ db }) =>
+    db
+      .select({ seq: EventSequenceTable.seq, ownerID: EventSequenceTable.owner_id })
+      .from(EventSequenceTable)
+      .where(eq(EventSequenceTable.aggregate_id, sessionID))
+      .get()
+      .pipe(Effect.orDie),
+  )
+
+const eventRows = (sessionID: SessionID) =>
+  Database.Service.use(({ db }) =>
+    db
+      .select({ id: EventTable.id })
+      .from(EventTable)
+      .where(eq(EventTable.aggregate_id, sessionID))
+      .all()
+      .pipe(Effect.orDie),
+  )
+
+const partRows = (sessionID: SessionID) =>
+  Database.Service.use(({ db }) =>
+    db
+      .select({ id: PartTable.id })
+      .from(PartTable)
+      .where(eq(PartTable.session_id, sessionID))
+      .all()
+      .pipe(Effect.orDie),
+  )
+
+const sessionRows = (sessionID: SessionID) =>
+  Database.Service.use(({ db }) =>
+    db
+      .select({ id: SessionTable.id })
+      .from(SessionTable)
+      .where(eq(SessionTable.id, sessionID))
+      .all()
+      .pipe(Effect.orDie),
+  )
 
 describe("session.created event", () => {
   it.instance("should emit session.created event when session is created", () =>
@@ -280,6 +328,165 @@ describe("Session", () => {
 
       expect(created.metadata).toBeUndefined()
       expect(saved.metadata).toBeUndefined()
+    }),
+  )
+})
+
+describe("delete-race regression", () => {
+  const userMessage = (sessionID: SessionID, id = MessageID.ascending()) =>
+    ({
+      id,
+      sessionID,
+      role: "user",
+      time: { created: Date.now() },
+      agent: "user",
+      model: { providerID: "test", modelID: "test" },
+      tools: {},
+      mode: "",
+    }) as unknown as SessionV1.Info
+
+  it.instance("concurrent updatePart vs remove fails typed and leaves the tombstone", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const info = yield* session.create({})
+      const messageID = MessageID.ascending()
+      yield* session.updateMessage(userMessage(info.id, messageID))
+      const part = {
+        id: PartID.ascending(),
+        messageID,
+        sessionID: info.id,
+        type: "text",
+        text: "race",
+      } as SessionV1.TextPart
+
+      // Fork the writer, then remove: the remove wins the aggregate lock and
+      // completes first, so the post-removal writer fails typed NotFoundError
+      // instead of resurrecting the aggregate. The gate makes the ordering
+      // deterministic: the writer only runs once the remove has fully
+      // committed the tombstone.
+      const gate = yield* Deferred.make<void>()
+      const fiber = yield* Effect.forkChild(
+        Deferred.await(gate).pipe(Effect.andThen(() => session.updatePart(part))),
+      )
+      const removeExit = yield* remove(info.id).pipe(Effect.exit)
+      expect(Exit.isSuccess(removeExit)).toBe(true)
+      yield* Deferred.succeed(gate, void 0)
+
+      const exit = yield* Fiber.await(fiber)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(Cause.hasDies(exit.cause)).toBe(false)
+        expect(Cause.squash(exit.cause)).toBeInstanceOf(NotFoundError)
+      }
+
+      expect(yield* partRows(info.id)).toHaveLength(0)
+      expect(yield* eventRows(info.id)).toHaveLength(0)
+      const sequence = yield* sessionSequenceRow(info.id)
+      // The tombstone is the fenced sequence row: seq > 0 with the original
+      // owner. A buggy remove that deleted the row (or reset it to seq 0)
+      // would let the stale writer resurrect the aggregate.
+      expect(sequence).toBeDefined()
+      expect(sequence!.seq).toBeGreaterThan(0)
+      expect(sequence!.ownerID).toBe("global")
+    }),
+  )
+
+  it.instance("interrupt finalize on a removed session fails typed NotFoundError", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const run = yield* SessionRunState.Service
+      const info = yield* session.create({})
+      yield* remove(info.id)
+
+      const onInterrupt = session.updateMessage(userMessage(info.id)).pipe(
+        Effect.map((info) => ({ info, parts: [] }) as SessionV1.WithParts),
+      )
+      const fiber = yield* run.ensureRunning(info.id, onInterrupt, Effect.never).pipe(Effect.forkChild)
+      // Let the forked ensureRunning register its runner before cancelling, so
+      // the cancel actually interrupts the in-flight run and drives the
+      // interrupt finalize path.
+      yield* Effect.yieldNow
+      yield* run.cancel(info.id)
+
+      const exit = yield* Fiber.await(fiber)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(Cause.hasDies(exit.cause)).toBe(false)
+        expect(Cause.squash(exit.cause)).toBeInstanceOf(NotFoundError)
+      }
+    }),
+  )
+
+  it.instance("removing an idle session leaves the owned tombstone row", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const info = yield* session.create({})
+
+      const exit = yield* remove(info.id).pipe(Effect.exit)
+      expect(Exit.isSuccess(exit)).toBe(true)
+
+      const getExit = yield* session.get(info.id).pipe(Effect.exit)
+      expect(Exit.isFailure(getExit)).toBe(true)
+      if (Exit.isFailure(getExit)) {
+        expect(Cause.squash(getExit.cause)).toBeInstanceOf(NotFoundError)
+      }
+
+      const sequence = yield* sessionSequenceRow(info.id)
+      expect(sequence).toEqual({ seq: 1, ownerID: "global" })
+      expect(yield* eventRows(info.id)).toHaveLength(0)
+    }),
+  )
+
+  it.instance("stale seq-0 replay dies once the owned tombstone is engaged", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const events = yield* EventV2Bridge.Service
+      const info = yield* session.create({})
+      yield* remove(info.id)
+
+      // Raw `info` from session.create fails decode because workspaceID is
+      // absent; encode through the event data schema so replay sees a valid
+      // serialized Created event at the pre-removal seq 0.
+      const data = Schema.encodeUnknownSync(SessionV1.Event.Created.data)({
+        sessionID: info.id,
+        info,
+      }) as Record<string, unknown>
+      const serialized: EventV2.SerializedEvent = {
+        id: EventV2.ID.create(),
+        type: EventV2.versionedType(SessionV1.Event.Created.type, 1),
+        seq: 0,
+        aggregateID: info.id,
+        data,
+      }
+
+      const exit = yield* events
+        .replay(serialized, { ownerID: "global", strictOwner: true })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(Cause.hasDies(exit.cause)).toBe(true)
+      }
+      expect(yield* eventRows(info.id)).toHaveLength(0)
+    }),
+  )
+
+  it.instance("remove dies on a foreign-owner fence and leaves state intact", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const events = yield* EventV2Bridge.Service
+      const info = yield* session.create({})
+      yield* events.claim(info.id, "wrk_foreign")
+
+      const exit = yield* remove(info.id).pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(Cause.hasDies(exit.cause)).toBe(true)
+        expect(Cause.squash(exit.cause)).toBeInstanceOf(EventV2.OwnerFenceError)
+      }
+
+      expect(yield* sessionRows(info.id)).toHaveLength(1)
+      const sequence = yield* sessionSequenceRow(info.id)
+      expect(sequence).toEqual({ seq: 0, ownerID: "wrk_foreign" })
     }),
   )
 })

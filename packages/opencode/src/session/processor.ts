@@ -23,6 +23,7 @@ import { Question } from "@/question"
 import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { NotFoundError } from "@/storage/storage"
 import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 
@@ -34,7 +35,7 @@ export interface Handle {
   readonly updateToolCall: (
     toolCallID: string,
     update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
-  ) => Effect.Effect<SessionV1.ToolPart | undefined>
+  ) => Effect.Effect<SessionV1.ToolPart | undefined, NotFoundError>
   readonly completeToolCall: (
     toolCallID: string,
     output: {
@@ -43,8 +44,8 @@ export interface Handle {
       output: string
       attachments?: SessionV1.FilePart[]
     },
-  ) => Effect.Effect<void>
-  readonly process: (streamInput: LLM.StreamInput) => Effect.Effect<Result>
+  ) => Effect.Effect<void, NotFoundError>
+  readonly process: (streamInput: LLM.StreamInput) => Effect.Effect<Result, NotFoundError>
 }
 
 type Input = {
@@ -699,7 +700,7 @@ const layer = Layer.effect(
               }),
             ),
             Effect.catch(halt),
-            Effect.ensuring(cleanup()),
+            Effect.ensuring(cleanup().pipe(Effect.catchTag("NotFoundError", () => Effect.void))),
           )
 
           if (ctx.needsCompaction) return "compact"

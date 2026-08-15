@@ -5,6 +5,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Snapshot } from "@/snapshot"
 import { Session } from "./session"
 import { SessionID, MessageID } from "./schema"
+import { NotFoundError } from "@/storage/storage"
 import { Config } from "@/config/config"
 
 function unquoteGitPath(input: string) {
@@ -64,7 +65,7 @@ function unquoteGitPath(input: string) {
 }
 
 export interface Interface {
-  readonly summarize: (input: { sessionID: SessionID; messageID: MessageID }) => Effect.Effect<void>
+  readonly summarize: (input: { sessionID: SessionID; messageID: MessageID }) => Effect.Effect<void, NotFoundError>
   readonly diff: (input: { sessionID: SessionID; messageID?: MessageID }) => Effect.Effect<Snapshot.FileDiff[]>
   readonly computeDiff: (input: { messages: SessionV1.WithParts[] }) => Effect.Effect<Snapshot.FileDiff[]>
 }

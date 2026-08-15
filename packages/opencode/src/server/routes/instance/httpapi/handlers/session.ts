@@ -279,16 +279,18 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       const defaultAgent = yield* agentSvc.defaultAgent()
       const currentAgent = messages.findLast((message) => message.info.role === "user")?.info.agent ?? defaultAgent
 
-      yield* compactSvc.create({
-        sessionID: ctx.params.sessionID,
-        agent: currentAgent,
-        model: {
-          providerID: ctx.payload.providerID,
-          modelID: ctx.payload.modelID,
-        },
-        auto: ctx.payload.auto ?? false,
-      })
-      yield* promptSvc.loop({ sessionID: ctx.params.sessionID })
+      yield* SessionError.mapStorageNotFound(
+        compactSvc.create({
+          sessionID: ctx.params.sessionID,
+          agent: currentAgent,
+          model: {
+            providerID: ctx.payload.providerID,
+            modelID: ctx.payload.modelID,
+          },
+          auto: ctx.payload.auto ?? false,
+        }),
+      )
+      yield* SessionError.mapStorageNotFound(promptSvc.loop({ sessionID: ctx.params.sessionID }))
       return true
     })
 
@@ -407,7 +409,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       ) {
         return yield* new HttpApiError.BadRequest({})
       }
-      return yield* session.updatePart(payload)
+      return yield* SessionError.mapStorageNotFound(session.updatePart(payload))
     })
 
     return handlers

@@ -39,7 +39,7 @@ import { SessionID, MessageID, PartID } from "./schema"
 
 import type { Provider } from "@/provider/provider"
 import { Global } from "@opencode-ai/core/global"
-import { Cause, Effect, Layer, Option, Context, Schema, Types } from "effect"
+import { Cause, Effect, Layer, Option, Context, Result, Schema, Types } from "effect"
 import { NonNegativeInt, optional } from "@opencode-ai/core/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -540,7 +540,10 @@ const layer: Layer.Layer<
       }
       yield* Effect.logInfo("created", result)
 
-      yield* events.publish(SessionV1.Event.Created, { sessionID: result.id, info: result })
+      yield* events.publish(SessionV1.Event.Created, { sessionID: result.id, info: result }, {
+        ownerID: ownerOf(result),
+        strictOwner: true,
+      })
 
       return result
     })
@@ -661,10 +664,11 @@ const layer: Layer.Layer<
           // silently swallowed OwnerFenceError and reported success. Narrow
           // the catch to non-fence failures and re-die fence errors so
           // deletion cannot falsely report success.
-          Effect.catchAllCause((cause) =>
+          Effect.catchCause((cause) =>
             Effect.gen(function* () {
-              if (Cause.isDieType(cause) && cause.defect instanceof OwnerFenceError) {
-                yield* Effect.die(cause.defect)
+              const found = Cause.findDefect(cause)
+              if (!Result.isFailure(found) && found.success instanceof OwnerFenceError) {
+                yield* Effect.die(found.success)
               }
               yield* Effect.logError("failed to remove session", { sessionID, cause })
             }),
@@ -799,24 +803,33 @@ const layer: Layer.Layer<
 
     const patch = (sessionID: SessionID, info: Patch, eventID?: EventV2.ID) =>
       Effect.gen(function* () {
-        const current = yield* get(sessionID)
-        const next = {
-          ...current,
-          ...info,
-          time: info.time ? { ...current.time, ...info.time } : current.time,
-          share: info.share === null ? undefined : info.share ? { ...current.share, ...info.share } : current.share,
-          summary: info.summary === null ? undefined : (info.summary ?? current.summary),
-          revert: info.revert === null ? undefined : (info.revert ?? current.revert),
-          permission: info.permission === null ? undefined : (info.permission ?? current.permission),
-        } as Info
-        yield* events.publish(
-          SessionV1.Event.Updated,
-          { sessionID, info: next },
-          {
-            id: eventID,
-            ownerID: ownerOf(current),
-            strictOwner: true,
-          },
+        // Serialize with deletion and other writers under the aggregate lock:
+        // a concurrent remove must not observe a half-published update, and a
+        // writer running after remove fails typed on the missing session
+        // instead of resurrecting the aggregate.
+        yield* events.exclusive(
+          sessionID,
+          Effect.gen(function* () {
+            const current = yield* get(sessionID)
+            const next = {
+              ...current,
+              ...info,
+              time: info.time ? { ...current.time, ...info.time } : current.time,
+              share: info.share === null ? undefined : info.share ? { ...current.share, ...info.share } : current.share,
+              summary: info.summary === null ? undefined : (info.summary ?? current.summary),
+              revert: info.revert === null ? undefined : (info.revert ?? current.revert),
+              permission: info.permission === null ? undefined : (info.permission ?? current.permission),
+            } as Info
+            yield* events.publish(
+              SessionV1.Event.Updated,
+              { sessionID, info: next },
+              {
+                id: eventID,
+                ownerID: ownerOf(current),
+                strictOwner: true,
+              },
+            )
+          }),
         )
       })
 
@@ -891,15 +904,24 @@ const layer: Layer.Layer<
       eventID?: EventV2.ID
       ownerID?: string
     }) {
-      const current = yield* get(input.sessionID).pipe(Effect.orDie)
       yield* events
-        .publish(
-          SessionV1.Event.Updated,
-          {
-            sessionID: input.sessionID,
-            info: { ...current, workspaceID: input.workspaceID, time: { ...current.time, updated: Date.now() } },
-          },
-          { id: input.eventID, ownerID: input.ownerID ?? ownerOf(current), strictOwner: true },
+        .exclusive(
+          input.sessionID,
+          Effect.gen(function* () {
+            const current = yield* get(input.sessionID)
+            yield* events.publish(
+              SessionV1.Event.Updated,
+              {
+                sessionID: input.sessionID,
+                info: {
+                  ...current,
+                  workspaceID: input.workspaceID,
+                  time: { ...current.time, updated: Date.now() },
+                },
+              },
+              { id: input.eventID, ownerID: input.ownerID ?? ownerOf(current), strictOwner: true },
+            )
+          }),
         )
         .pipe(Effect.orDie)
     })
@@ -938,14 +960,19 @@ const layer: Layer.Layer<
       sessionID: SessionID
       messageID: MessageID
     }) {
-      const current = yield* get(input.sessionID).pipe(Effect.orDie)
-      yield* events.publish(
-        SessionV1.Event.MessageRemoved,
-        {
-          sessionID: input.sessionID,
-          messageID: input.messageID,
-        },
-        { ownerID: ownerOf(current), strictOwner: true },
+      yield* events.exclusive(
+        input.sessionID,
+        Effect.gen(function* () {
+          const current = yield* get(input.sessionID).pipe(Effect.orDie)
+          yield* events.publish(
+            SessionV1.Event.MessageRemoved,
+            {
+              sessionID: input.sessionID,
+              messageID: input.messageID,
+            },
+            { ownerID: ownerOf(current), strictOwner: true },
+          )
+        }),
       )
       return input.messageID
     })
@@ -955,15 +982,20 @@ const layer: Layer.Layer<
       messageID: MessageID
       partID: PartID
     }) {
-      const current = yield* get(input.sessionID).pipe(Effect.orDie)
-      yield* events.publish(
-        SessionV1.Event.PartRemoved,
-        {
-          sessionID: input.sessionID,
-          messageID: input.messageID,
-          partID: input.partID,
-        },
-        { ownerID: ownerOf(current), strictOwner: true },
+      yield* events.exclusive(
+        input.sessionID,
+        Effect.gen(function* () {
+          const current = yield* get(input.sessionID).pipe(Effect.orDie)
+          yield* events.publish(
+            SessionV1.Event.PartRemoved,
+            {
+              sessionID: input.sessionID,
+              messageID: input.messageID,
+              partID: input.partID,
+            },
+            { ownerID: ownerOf(current), strictOwner: true },
+          )
+        }),
       )
       return input.partID
     })

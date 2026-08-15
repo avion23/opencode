@@ -7,7 +7,7 @@ export function mapStorageNotFound<A, R>(self: Effect.Effect<A, StorageNotFoundE
   return self.pipe(Effect.mapError((error) => ApiError.notFound(error.message)))
 }
 
-export function mapBusy<A, R>(self: Effect.Effect<A, Session.BusyError, R>) {
+export function mapBusy<A, R>(self: Effect.Effect<A, Session.BusyError | StorageNotFoundError, R>) {
   return self.pipe(
     Effect.catchTag("SessionBusyError", (error) =>
       Effect.fail(
@@ -17,5 +17,6 @@ export function mapBusy<A, R>(self: Effect.Effect<A, Session.BusyError, R>) {
         }),
       ),
     ),
+    Effect.catchTag("NotFoundError", (error) => Effect.fail(ApiError.notFound(error.message))),
   )
 }
