@@ -1,6 +1,6 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
-import { Context, Effect, Exit, FiberMap, Layer, Schedule, Schema, Stream } from "effect"
+import { Cause, Context, Effect, Exit, FiberMap, Layer, Option, Schedule, Schema, Stream } from "effect"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { FetchHttpClient, HttpBody, HttpClient, HttpClientError, HttpClientRequest } from "effect/unstable/http"
 import { Database } from "@opencode-ai/core/database/database"
@@ -526,16 +526,24 @@ const layer = Layer.effect(
               }
             }),
           ).pipe(
-            // A mid-stream failure (reset connection, malformed chunk after a
-            // successful connect) must not kill the sync loop: fall through
-            // to the backoff reconnect below instead of terminating the
-            // workspace listener.
-            Effect.catch((error) =>
-              Effect.logWarning("workspace event stream failed", {
+            // A mid-stream failure or defect (reset connection, malformed
+            // chunk after a successful connect, unexpected die) must not kill
+            // the sync loop: log it and fall through to the backoff reconnect
+            // below instead of terminating the workspace listener. An
+            // interruption, however, must propagate so stopSync can tear the
+            // listener down.
+            Effect.catchCause((cause) => {
+              if (Cause.hasInterruptsOnly(cause)) return Effect.interrupt
+              const error = Cause.findErrorOption(cause).pipe(
+                // Defects are not typed errors: convert the die to a loggable
+                // value so a crash inside the stream is visible in the logs.
+                Option.getOrElse(() => Cause.squash(cause)),
+              )
+              return Effect.logWarning("workspace event stream failed", {
                 workspaceID: space.id,
                 error: errorData(error),
-              }),
-            ),
+              })
+            }),
           )
 
           setStatus(space.id, "disconnected")
