@@ -5,7 +5,7 @@ import Http from "node:http"
 import path from "node:path"
 import { NodeHttpServer } from "@effect/platform-node"
 import { Context, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
-import { HttpClient, HttpClientResponse, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
+import { HttpBody, HttpClient, HttpClientResponse, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { eq } from "drizzle-orm"
 import { GlobalBus, type GlobalEvent } from "@/bus/global"
 import { Project } from "@/project/project"
@@ -83,10 +83,17 @@ const timeoutIt = testEffect(
           return Effect.succeed(
             HttpClientResponse.fromWeb(request, Response.json({ error: "unavailable" }, { status: 503 })),
           )
+        const body = JSON.parse(new TextDecoder().decode((request.body as HttpBody.Uint8Array).body)) as {
+          events?: Array<{ aggregateID?: string }>
+        }
         return Effect.succeed(
           HttpClientResponse.fromWeb(
             request,
-            Response.json(new URL(request.url).pathname === "/warp-source/sync/history" ? [] : { sessionID: "ok" }),
+            Response.json(
+              new URL(request.url).pathname === "/warp-source/sync/history"
+                ? []
+                : { sessionID: body.events?.[0]?.aggregateID ?? "ok" },
+            ),
           ),
         )
       }),
@@ -396,6 +403,17 @@ function sessionSequenceOwner(sessionID: SessionID) {
         Effect.orDie,
         Effect.map((row) => row?.ownerID),
       ),
+  )
+}
+
+function sessionEventCount(sessionID: SessionID) {
+  return Database.Service.use(({ db }) =>
+    db
+      .select({ id: EventTable.id })
+      .from(EventTable)
+      .where(eq(EventTable.aggregate_id, sessionID))
+      .all()
+      .pipe(Effect.orDie, Effect.map((rows) => rows.length)),
   )
 }
 
@@ -1122,7 +1140,11 @@ describe("workspace CRUD", () => {
               "POST /warp-target/sync/replay",
               "POST /warp-target/sync/steal",
             ])
-            expect(calls[0].json).toEqual({ [session.id]: historyNextSeq - 1 })
+            expect(calls[0].json).toEqual({
+              scope: "aggregate",
+              state: { [session.id]: historyNextSeq - 1 },
+              fence: { sessionID: session.id, ownerID: target.id },
+            })
             expect(calls[2].json).toEqual({ patch: "remote patch" })
             expect(calls[3].json).toMatchObject({
               directory: "remote-target-dir",
@@ -1451,9 +1473,20 @@ describe("workspace CRUD", () => {
                 .sessionWarp({ workspaceID: target.id, sessionID: session.id })
                 .pipe(Effect.exit)
               expectExitContains(exit, "WorkspaceSessionWarpHttpError", "Timed out stealing session")
-              expect(yield* sessionSequenceOwner(session.id)).toBe(instance.project.id)
-              yield* sessionSvc.setTitle({ sessionID: session.id, title: "after timeout" })
-              expect((yield* sessionSvc.get(session.id)).title).toBe("after timeout")
+              expect(yield* sessionSequenceOwner(session.id)).toBe(target.id)
+              // The destination owns the session after the failed timeout warp, so a
+              // local write must be rejected fail-closed (defect via Effect.die,
+              // contained) and leave no trace behind.
+              const seqBefore = yield* sessionSequence(session.id)
+              const titleBefore = (yield* sessionSvc.get(session.id)).title
+              const rowsBefore = yield* sessionEventCount(session.id)
+              const writeExit = yield* sessionSvc
+                .setTitle({ sessionID: session.id, title: "after timeout" })
+                .pipe(Effect.exit)
+              expectExitContains(writeExit, "InvalidDurableEvent", "Local owner mismatch")
+              expect(yield* sessionSequence(session.id)).toBe(seqBefore)
+              expect((yield* sessionSvc.get(session.id)).title).toBe(titleBefore)
+              expect(yield* sessionEventCount(session.id)).toBe(rowsBefore)
             }),
           { git: true },
         )
@@ -1504,9 +1537,92 @@ describe("workspace CRUD", () => {
               yield* Fiber.interrupt(fiber)
               yield* Deferred.succeed(finishSteal, undefined)
 
-              expect(yield* sessionSequenceOwner(session.id)).toBe(instance.project.id)
-              yield* sessionSvc.setTitle({ sessionID: session.id, title: "after interruption" })
-              expect((yield* sessionSvc.get(session.id)).title).toBe("after interruption")
+              expect(yield* sessionSequenceOwner(session.id)).toBe(target.id)
+              // The interrupted steal left the session owned by the destination, so a
+              // local write must be rejected fail-closed (defect via Effect.die,
+              // contained) and leave no trace behind.
+              const seqBefore = yield* sessionSequence(session.id)
+              const titleBefore = (yield* sessionSvc.get(session.id)).title
+              const rowsBefore = yield* sessionEventCount(session.id)
+              const writeExit = yield* sessionSvc
+                .setTitle({ sessionID: session.id, title: "after interruption" })
+                .pipe(Effect.exit)
+              expectExitContains(writeExit, "InvalidDurableEvent", "Local owner mismatch")
+              expect(yield* sessionSequence(session.id)).toBe(seqBefore)
+              expect((yield* sessionSvc.get(session.id)).title).toBe(titleBefore)
+              expect(yield* sessionEventCount(session.id)).toBe(rowsBefore)
+            }),
+          { git: true },
+        )
+      }),
+    20_000,
+  )
+
+  it.live(
+    "sessionWarp restores source ownership when interrupted during destination replay",
+    () =>
+      Effect.gen(function* () {
+        const replayStarted = yield* Deferred.make<void>()
+        const blockReplay = yield* Deferred.make<void>()
+        yield* HttpServer.serveEffect()(
+          Effect.gen(function* () {
+            const req = yield* HttpServerRequest.HttpServerRequest
+            const bodyText = yield* req.text
+            const body = (bodyText ? JSON.parse(bodyText) : {}) as { events?: Array<{ aggregateID?: string }> }
+            const url = new URL(req.url, "http://localhost")
+            if (url.pathname === "/warp-source/sync/history") return yield* HttpServerResponse.json([])
+            if (url.pathname === "/warp-target/sync/replay") {
+              yield* Deferred.succeed(replayStarted, undefined)
+              yield* Deferred.await(blockReplay)
+              return yield* HttpServerResponse.json({ sessionID: body.events?.[0]?.aggregateID ?? "ok" })
+            }
+            if (url.pathname === "/warp-target/sync/history") return yield* HttpServerResponse.json([])
+            return HttpServerResponse.text("unexpected", { status: 500 })
+          }),
+        )
+        const url = yield* serverUrl()
+        yield* provideTmpdirInstance(
+          () =>
+            Effect.gen(function* () {
+              const workspace = yield* Workspace.Service
+              const sessionSvc = yield* SessionNs.Service
+              const instance = yield* requireInstance
+              const previousType = unique("warp-replay-interrupt-source")
+              const targetType = unique("warp-replay-interrupt-target")
+              const previous = workspaceInfo(instance.project.id, previousType)
+              const target = workspaceInfo(instance.project.id, targetType, { directory: "remote-target-dir" })
+              yield* insertWorkspace(previous)
+              yield* insertWorkspace(target)
+              registerAdapter(instance.project.id, previousType, remoteAdapter(`${url}/warp-source`).adapter)
+              registerAdapter(instance.project.id, targetType, remoteAdapter(`${url}/warp-target`).adapter)
+              const session = yield* sessionSvc.create({})
+              yield* attachSessionToWorkspace(session.id, previous.id)
+              const seqBefore = yield* sessionSequence(session.id)
+              const titleBefore = (yield* sessionSvc.get(session.id)).title
+              const rowsBefore = yield* sessionEventCount(session.id)
+
+              const fiber = yield* workspace
+                .sessionWarp({ workspaceID: target.id, sessionID: session.id })
+                .pipe(Effect.forkChild)
+              yield* Deferred.await(replayStarted)
+              yield* Fiber.interrupt(fiber)
+              yield* Deferred.succeed(blockReplay, undefined)
+
+              // The interrupt re-delivery defect is fixed: the onExit finalizer
+              // inside the mask runs the restore cascade before the interrupt
+              // terminates the fiber, so the durable owner is re-fenced back to
+              // previous.id, the session remains attached to the source
+              // workspace, and the interrupted warp left no mutation behind.
+              expect(yield* sessionSequenceOwner(session.id)).toBe(previous.id)
+              expect((yield* sessionSvc.get(session.id)).workspaceID).toBe(previous.id)
+              expect(yield* sessionSequence(session.id)).toBe(seqBefore)
+              expect((yield* sessionSvc.get(session.id)).title).toBe(titleBefore)
+              expect(yield* sessionEventCount(session.id)).toBe(rowsBefore)
+
+              // The session remains usable from the source workspace (fail-closed:
+              // no orphaned destination state), so a local write still lands.
+              yield* sessionSvc.setTitle({ sessionID: session.id, title: "after interrupted replay" })
+              expect((yield* sessionSvc.get(session.id)).title).toBe("after interrupted replay")
             }),
           { git: true },
         )
@@ -1623,10 +1739,11 @@ describe("workspace CRUD", () => {
               return HttpServerResponse.text("{", { contentType: "application/json" })
             }
             if (url.pathname === "/warp-target/sync/history") {
+              const state = (body as { state?: Record<string, number> }).state ?? {}
               return yield* HttpServerResponse.json(
                 destinationEvents.filter(
                   (event) =>
-                    event.aggregate_id === Object.keys(body)[0]! && event.seq > Number(Object.values(body)[0]),
+                    event.aggregate_id === Object.keys(state)[0]! && event.seq > Number(Object.values(state)[0]),
                 ),
               )
             }

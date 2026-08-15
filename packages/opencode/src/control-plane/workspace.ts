@@ -1154,63 +1154,86 @@ const layer = Layer.effect(
         )
       })
 
-      const exit = yield* Effect.uninterruptibleMask((restore) => restore(handoff).pipe(Effect.exit))
-      if (Exit.isSuccess(exit)) return exit.value
-
       // Restore-semantics cascade on handoff failure: keep the destination
       // fenced once it may have committed, restore the source only when the
       // destination demonstrably has nothing, and fail closed otherwise.
-      const cleanup = Effect.uninterruptible(
-        Effect.gen(function* () {
-          if (destinationCommitted || destinationOutcomeUnknown) return
-          const conflict = Cause.findErrorOption(exit.cause)
-          if (Option.isSome(conflict) && conflict.value._tag === "WorkspaceSessionWarpConflictError") {
-            yield* rollbackCopy
-            yield* events.claim(input.sessionID, previous?.id ?? sourceOwner)
-            return
-          }
-          if (destinationReplaySucceeded) return
-          if (destination && destinationTarget?.type === "remote") {
-            const history = yield* http
-              .execute(
-                HttpClientRequest.post(route(destinationTarget.url, "/sync/history"), {
-                  headers: new Headers(destinationTarget.headers),
-                  body: HttpBody.jsonUnsafe({
-                    scope: "aggregate",
-                    state: { [input.sessionID]: replaySnapshotSeq ?? -1 },
-                  }),
-                }),
-              )
-              .pipe(
-                Effect.flatMap((response) =>
-                  Effect.gen(function* () {
-                    if (response.status < 200 || response.status >= 300) return undefined
-                    const raw = yield* response.json
-                    return yield* Effect.try({
-                      try: () => Schema.decodeUnknownSync(Schema.Array(RemoteHistoryEvent))(raw),
-                      catch: () => undefined,
-                    })
-                  }),
-                ),
-                Effect.timeoutOption("2 seconds"),
-                Effect.catch(() => Effect.succeed(undefined)),
-              )
-            const sessionEvents = (history?._tag === "Some" ? history.value : undefined)?.filter(
-              (item) => item.aggregate_id === input.sessionID && item.seq > (replaySnapshotSeq ?? -1),
-            )
-            if (sessionEvents !== undefined && sessionEvents.length === 0) {
+      // It runs on the plain-error path after the mask AND on the interrupt
+      // path via the onExit finalizer below. The finalizer is required because
+      // effect@beta.83's exitFailCause skips every post-mask continuation
+      // (including the Effect.exit capture) while an interrupt is pending in
+      // the interruptible case, so the post-mask cascade is unreachable on
+      // interrupt — the onExit finalizer is the only place that runs.
+      const restoreCascade = (exit: Exit.Failure<unknown, unknown>) =>
+        Effect.uninterruptible(
+          Effect.gen(function* () {
+            if (destinationCommitted || destinationOutcomeUnknown) return
+            const conflict = Cause.findErrorOption(exit.cause as Cause.Cause<{ _tag: string }>)
+            if (Option.isSome(conflict) && conflict.value._tag === "WorkspaceSessionWarpConflictError") {
               yield* rollbackCopy
-              if (sourceFenced) yield* restoreSource
-              else yield* events.claim(input.sessionID, sourceOwner)
+              yield* events.claim(input.sessionID, previous?.id ?? sourceOwner)
+              return
             }
-            return
-          }
-          yield* rollbackCopy
-          if (sourceFenced) yield* restoreSource
-          else yield* events.claim(input.sessionID, sourceOwner)
-        }),
+            if (destinationReplaySucceeded) return
+            if (destination && destinationTarget?.type === "remote") {
+              const history = yield* http
+                .execute(
+                  HttpClientRequest.post(route(destinationTarget.url, "/sync/history"), {
+                    headers: new Headers(destinationTarget.headers),
+                    body: HttpBody.jsonUnsafe({
+                      scope: "aggregate",
+                      state: { [input.sessionID]: replaySnapshotSeq ?? -1 },
+                    }),
+                  }),
+                )
+                .pipe(
+                  Effect.flatMap((response) =>
+                    Effect.gen(function* () {
+                      if (response.status < 200 || response.status >= 300) return undefined
+                      const raw = yield* response.json
+                      return yield* Effect.try({
+                        try: () => Schema.decodeUnknownSync(Schema.Array(RemoteHistoryEvent))(raw),
+                        catch: () => undefined,
+                      })
+                    }),
+                  ),
+                  Effect.timeoutOption("2 seconds"),
+                  Effect.catch(() => Effect.succeed(undefined)),
+                )
+              const sessionEvents = (history?._tag === "Some" ? history.value : undefined)?.filter(
+                (item) => item.aggregate_id === input.sessionID && item.seq > (replaySnapshotSeq ?? -1),
+              )
+              if (sessionEvents !== undefined && sessionEvents.length === 0) {
+                yield* rollbackCopy
+                if (sourceFenced) yield* restoreSource
+                else yield* events.claim(input.sessionID, sourceOwner)
+              }
+              return
+            }
+            yield* rollbackCopy
+            if (sourceFenced) yield* restoreSource
+            else yield* events.claim(input.sessionID, sourceOwner)
+          }),
+        )
+
+      // Exactly-once guard between the two cascade entry points: a pending
+      // interrupt can be re-delivered after the mask boundary, so both the
+      // onExit finalizer and the post-mask path can observe the same failure.
+      let restoreHandled = false
+      const exit = yield* Effect.uninterruptibleMask((restore) =>
+        restore(handoff).pipe(
+          Effect.onExit((exit) => {
+            if (Exit.isSuccess(exit) || !Exit.hasInterrupts(exit)) return Effect.void
+            if (restoreHandled) return Effect.void
+            restoreHandled = true
+            return restoreCascade(exit)
+          }),
+          Effect.exit,
+        ),
       )
-      const cleanupExit = yield* Effect.exit(cleanup)
+      if (Exit.isSuccess(exit)) return exit.value
+
+      restoreHandled = true
+      const cleanupExit = yield* Effect.exit(restoreCascade(exit))
       if (Exit.isFailure(cleanupExit)) return yield* Effect.failCause(cleanupExit.cause)
       return yield* Effect.failCause(exit.cause)
     })
