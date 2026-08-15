@@ -301,9 +301,12 @@ describe("MoveSession", () => {
         Effect.promise(() => tmpdir()),
         (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
       )
+      yield* Effect.promise(() => initRepo(root.path))
       const source = abs(yield* Effect.promise(() => fs.realpath(root.path)))
       const destination = abs(path.join(source, "packages"))
       yield* Effect.promise(() => fs.mkdir(destination))
+      yield* Effect.promise(() => fs.writeFile(path.join(source, "tracked.txt"), "changed\n"))
+      yield* Effect.promise(() => fs.writeFile(path.join(destination, "destination.txt"), "untouched\n"))
 
       const projectID = (yield* Project.Service.use((service) => service.resolve(source))).id
       const sessionID = SessionV2.ID.make("ses_move_owner_mismatch")
@@ -336,9 +339,14 @@ describe("MoveSession", () => {
         .pipe(Effect.orDie)
 
       const exit = yield* MoveSession.Service.use((service) =>
-        service.moveSession({ sessionID, destination: { directory: destination }, moveChanges: false }),
+        service.moveSession({ sessionID, destination: { directory: destination }, moveChanges: true }),
       ).pipe(Effect.exit)
       expect(Exit.isFailure(exit) && Cause.squash(exit.cause)).toBeInstanceOf(MoveSession.SourceOwnerMismatchError)
+      expect(yield* Effect.promise(() => fs.readFile(path.join(source, "tracked.txt"), "utf8"))).toBe("changed\n")
+      expect(yield* Effect.promise(() => fs.readFile(path.join(destination, "destination.txt"), "utf8"))).toBe(
+        "untouched\n",
+      )
+      expect(yield* Effect.promise(() => Bun.file(path.join(destination, "tracked.txt")).exists())).toBe(false)
     }),
   )
 

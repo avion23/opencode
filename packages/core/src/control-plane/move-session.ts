@@ -101,6 +101,22 @@ const layer = Layer.effect(
         return yield* new DestinationProjectMismatchError({ expected: current.projectID, actual: destination.id })
       }
 
+      // Validate the durable source owner before any capture or apply can mutate
+      // the source or destination filesystem.
+      const sourceOwner = SessionOwner.ownerOf(current)
+      const sequence = yield* db
+        .select({ ownerID: EventSequenceTable.owner_id })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, input.sessionID))
+        .get()
+        .pipe(Effect.orDie)
+      if (sequence?.ownerID && sequence.ownerID !== sourceOwner)
+        return yield* new SourceOwnerMismatchError({
+          sessionID: input.sessionID,
+          durableOwner: sequence.ownerID,
+          sourceOwner,
+        })
+
       const moveChanges = input.moveChanges && source.directory !== destination.directory
       const sourceRepository = moveChanges ? yield* git.repo.discover(current.location.directory) : undefined
       if (moveChanges && !sourceRepository)
@@ -117,22 +133,6 @@ const layer = Layer.effect(
           .apply({ repository, path: directory, changes: patch })
           .pipe(Effect.mapError((error) => new ApplyChangesError({ message: error.message })))
       }
-
-      // The move must be written under the source owner: the event records the
-      // destination location but never claims destination ownership.
-      const sourceOwner = SessionOwner.ownerOf(current)
-      const sequence = yield* db
-        .select({ ownerID: EventSequenceTable.owner_id })
-        .from(EventSequenceTable)
-        .where(eq(EventSequenceTable.aggregate_id, input.sessionID))
-        .get()
-        .pipe(Effect.orDie)
-      if (sequence?.ownerID && sequence.ownerID !== sourceOwner)
-        return yield* new SourceOwnerMismatchError({
-          sessionID: input.sessionID,
-          durableOwner: sequence.ownerID,
-          sourceOwner,
-        })
 
       yield* events.publish(
         SessionEvent.Moved,
