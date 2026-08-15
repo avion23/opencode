@@ -174,6 +174,32 @@ describe("PublicApi OpenAPI v2 errors", () => {
     }
   })
 
+  test("requires the complete sync replay and history request bodies in memory and on disk", async () => {
+    const specs = [
+      OpenApi.fromApi(PublicApi) as OpenApiSpec,
+      (await Bun.file(new URL("../../../sdk/openapi.json", import.meta.url)).json()) as OpenApiSpec,
+    ]
+
+    for (const spec of specs) {
+      for (const path of ["/sync/replay", "/sync/history"] as const) {
+        const operation = spec.paths[path]?.post
+        expect(operation?.requestBody?.required, `${path} request body (${spec === specs[0] ? "memory" : "disk"})`).toBe(
+          true,
+        )
+      }
+
+      // Replay carries real protocol state: the event list and owner fence are
+      // mandatory; warpID remains an optional correlation hint.
+      const replayRequest =
+        spec.paths["/sync/replay"]?.post?.requestBody?.content?.["application/json"]?.schema
+      expect(
+        replayRequest?.$ref
+          ? spec.components.schemas[componentName(replayRequest.$ref)]?.required
+          : replayRequest?.required,
+      ).toEqual(expect.arrayContaining(["directory", "events", "ownerID"]))
+    }
+  })
+
   test("documents integration discovery and connection routes", () => {
     const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
 

@@ -100,7 +100,24 @@ const syncStealSdkPatched = historySdkPatched.replace(
 if (syncStealSdkPatched === historySdkPatched) {
   throw new Error("Sync steal required parameter SDK patch did not apply")
 }
-await Bun.write("./src/v2/gen/sdk.gen.ts", syncStealSdkPatched)
+// /sync/replay: like steal, hey-api still emits optional flat parameters
+// despite required=true in the spec, so force the required protocol body
+// fields (body_directory, events, ownerID). warpID stays optional.
+const syncReplaySdkPatched = syncStealSdkPatched.replace(
+  /(Replay sync events[\s\S]*?parameters)\?: \{([\s\S]*?body_directory)\?: string([\s\S]*?events)\?: (Array<\{[\s\S]*?\}>)([\s\S]*?ownerID)\?: string/,
+  "$1: {$2: string$3: $4$5: string",
+)
+if (syncReplaySdkPatched === syncStealSdkPatched) {
+  throw new Error("Sync replay required parameter SDK patch did not apply")
+}
+// /sync/history: unlike steal/replay, hey-api already honours required=true
+// here and emits parameters/body as required, so no transform is needed --
+// assert the invariant instead so a future codegen change fails the build.
+const syncHistorySdkPatched = syncReplaySdkPatched
+if (!/List sync events[\s\S]*?parameters: \{\s*directory\?: string;?\s*workspace\?: string;?\s*body: (?!\?)/.test(syncHistorySdkPatched)) {
+  throw new Error("Sync history required parameter SDK patch did not apply")
+}
+await Bun.write("./src/v2/gen/sdk.gen.ts", syncHistorySdkPatched)
 
 // Patch a @hey-api/openapi-ts codegen bug: SseFn incorrectly passes the
 // endpoint's TError into the second generic of ServerSentEventsResult, which

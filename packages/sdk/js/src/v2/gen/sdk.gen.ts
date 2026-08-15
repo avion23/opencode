@@ -4413,10 +4413,10 @@ export class History extends HeyApiClient {
    * List newer sync events for the requested aggregates. Keys are aggregate IDs and values are the last known sequence ID.
    */
   public list<ThrowOnError extends boolean = false>(
-    parameters?: {
+    parameters: {
       directory?: string
       workspace?: string
-      body?:
+      body:
         | {
             scope: "workspace"
           }
@@ -4496,11 +4496,11 @@ export class Sync extends HeyApiClient {
    * Validate and replay a complete sync event history.
    */
   public replay<ThrowOnError extends boolean = false>(
-    parameters?: {
+    parameters: {
       query_directory?: string
       workspace?: string
-      body_directory?: string
-      events?: Array<{
+      body_directory: string
+      events: Array<{
         id: string
         aggregateID: string
         seq: number
@@ -4509,7 +4509,7 @@ export class Sync extends HeyApiClient {
           [key: string]: unknown
         }
       }>
-      ownerID?: string
+      ownerID: string
       warpID?: string
     },
     options?: Options<never, ThrowOnError>,

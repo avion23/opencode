@@ -8634,7 +8634,8 @@
                 "additionalProperties": false
               }
             }
-          }
+          },
+          "required": true
         },
         "x-codeSamples": [
           {
@@ -8955,7 +8956,8 @@
                 ]
               }
             }
-          }
+          },
+          "required": true
         },
         "x-codeSamples": [
           {

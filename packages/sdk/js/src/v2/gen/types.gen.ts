@@ -10513,7 +10513,7 @@ export type SyncStartResponses = {
 export type SyncStartResponse = SyncStartResponses[keyof SyncStartResponses]
 
 export type SyncReplayData = {
-  body?: {
+  body: {
     directory: string
     events: Array<{
       id: string
@@ -10608,7 +10608,7 @@ export type SyncStealResponses = {
 export type SyncStealResponse = SyncStealResponses[keyof SyncStealResponses]
 
 export type SyncHistoryListData = {
-  body?:
+  body:
     | {
         scope: "workspace"
       }
