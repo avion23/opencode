@@ -94,8 +94,8 @@ if (historySdkPatched === generatedSdk) {
   throw new Error("Session history numeric SDK patch did not apply")
 }
 const syncStealSdkPatched = historySdkPatched.replace(
-  /(Steal session into workspace[\s\S]*?parameters)\?: \{([\s\S]*?sessionID)\?: string([;,]\s*seq)\?: number([;,]\s*warpID)\?: string/,
-  "$1: {$2: string$3: number$4: string",
+  /(Steal session into workspace[\s\S]*?parameters)\?: \{([\s\S]*?sessionID)\?: string([;,]\s*seq)\?: number([;,]\s*warpID)\?: string([;,]\s*ownerID)\?: string/,
+  "$1: {$2: string$3: number$4: string$5: string",
 )
 if (syncStealSdkPatched === historySdkPatched) {
   throw new Error("Sync steal required parameter SDK patch did not apply")

@@ -165,6 +165,7 @@ describe("PublicApi OpenAPI v2 errors", () => {
         "sessionID",
         "seq",
         "warpID",
+        "ownerID",
       ])
       expect(response?.$ref ? spec.components.schemas[componentName(response.$ref)]?.required : response?.required).toEqual([
         "sessionID",

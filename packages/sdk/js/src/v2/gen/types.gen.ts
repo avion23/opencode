@@ -8261,6 +8261,7 @@ export type VcsDiffRawResponse = VcsDiffRawResponses[keyof VcsDiffRawResponses]
 export type VcsApplyData = {
   body?: {
     patch: string
+    reverse?: boolean
   }
   path?: never
   query?: {
@@ -10523,6 +10524,8 @@ export type SyncReplayData = {
         [key: string]: unknown
       }
     }>
+    ownerID: string
+    warpID?: string
   }
   path?: never
   query?: {
@@ -10537,6 +10540,10 @@ export type SyncReplayErrors = {
    * BadRequest | InvalidRequestError
    */
   400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * Conflict
+   */
+  409: EffectHttpApiErrorConflict
 }
 
 export type SyncReplayError = SyncReplayErrors[keyof SyncReplayErrors]
@@ -10557,6 +10564,7 @@ export type SyncStealData = {
     sessionID: string
     seq: number
     warpID: string
+    ownerID: string
   }
   path?: never
   query?: {
@@ -10600,9 +10608,21 @@ export type SyncStealResponses = {
 export type SyncStealResponse = SyncStealResponses[keyof SyncStealResponses]
 
 export type SyncHistoryListData = {
-  body?: {
-    [key: string]: number
-  }
+  body?:
+    | {
+        scope: "workspace"
+      }
+    | {
+        scope: "aggregate"
+        state: {
+          [key: string]: number
+        }
+        ownerID?: string
+        fence?: {
+          sessionID: string
+          ownerID: string
+        }
+      }
   path?: never
   query?: {
     directory?: string
@@ -10616,6 +10636,10 @@ export type SyncHistoryListErrors = {
    * BadRequest | InvalidRequestError
    */
   400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * Conflict
+   */
+  409: EffectHttpApiErrorConflict
 }
 
 export type SyncHistoryListError = SyncHistoryListErrors[keyof SyncHistoryListErrors]

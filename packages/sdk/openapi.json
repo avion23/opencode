@@ -2799,6 +2799,9 @@
                 "properties": {
                   "patch": {
                     "type": "string"
+                  },
+                  "reverse": {
+                    "type": "boolean"
                   }
                 },
                 "required": [
@@ -8558,6 +8561,16 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/effect_HttpApiError_Conflict"
+                }
+              }
+            }
           }
         },
         "description": "Validate and replay a complete sync event history.",
@@ -8604,11 +8617,19 @@
                       ],
                       "additionalProperties": false
                     }
+                  },
+                  "ownerID": {
+                    "type": "string"
+                  },
+                  "warpID": {
+                    "type": "string",
+                    "pattern": "^evt_"
                   }
                 },
                 "required": [
                   "directory",
-                  "events"
+                  "events",
+                  "ownerID"
                 ],
                 "additionalProperties": false
               }
@@ -8747,12 +8768,16 @@
                   "warpID": {
                     "type": "string",
                     "pattern": "^evt_"
+                  },
+                  "ownerID": {
+                    "type": "string"
                   }
                 },
                 "required": [
                   "sessionID",
                   "seq",
-                  "warpID"
+                  "warpID",
+                  "ownerID"
                 ],
                 "additionalProperties": false
               }
@@ -8850,6 +8875,16 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/effect_HttpApiError_Conflict"
+                }
+              }
+            }
           }
         },
         "description": "List newer sync events for the requested aggregates. Keys are aggregate IDs and values are the last known sequence ID.",
@@ -8858,11 +8893,66 @@
           "content": {
             "application/json": {
               "schema": {
-                "type": "object",
-                "additionalProperties": {
-                  "type": "integer",
-                  "minimum": 0
-                }
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "scope": {
+                        "type": "string",
+                        "enum": [
+                          "workspace"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "scope"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "scope": {
+                        "type": "string",
+                        "enum": [
+                          "aggregate"
+                        ]
+                      },
+                      "state": {
+                        "type": "object",
+                        "additionalProperties": {
+                          "type": "integer",
+                          "minimum": -1
+                        }
+                      },
+                      "ownerID": {
+                        "type": "string"
+                      },
+                      "fence": {
+                        "type": "object",
+                        "properties": {
+                          "sessionID": {
+                            "type": "string",
+                            "pattern": "^ses"
+                          },
+                          "ownerID": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "sessionID",
+                          "ownerID"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "required": [
+                      "scope",
+                      "state"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
               }
             }
           }

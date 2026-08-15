@@ -2123,6 +2123,7 @@ export class Vcs extends HeyApiClient {
       directory?: string
       workspace?: string
       patch?: string
+      reverse?: boolean
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -2134,6 +2135,7 @@ export class Vcs extends HeyApiClient {
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
             { in: "body", key: "patch" },
+            { in: "body", key: "reverse" },
           ],
         },
       ],
@@ -4414,9 +4416,21 @@ export class History extends HeyApiClient {
     parameters?: {
       directory?: string
       workspace?: string
-      body?: {
-        [key: string]: number
-      }
+      body?:
+        | {
+            scope: "workspace"
+          }
+        | {
+            scope: "aggregate"
+            state: {
+              [key: string]: number
+            }
+            ownerID?: string
+            fence?: {
+              sessionID: string
+              ownerID: string
+            }
+          }
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -4495,6 +4509,8 @@ export class Sync extends HeyApiClient {
           [key: string]: unknown
         }
       }>
+      ownerID?: string
+      warpID?: string
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -4515,6 +4531,8 @@ export class Sync extends HeyApiClient {
               map: "directory",
             },
             { in: "body", key: "events" },
+            { in: "body", key: "ownerID" },
+            { in: "body", key: "warpID" },
           ],
         },
       ],
@@ -4543,6 +4561,7 @@ export class Sync extends HeyApiClient {
       sessionID: string
       seq: number
       warpID: string
+      ownerID: string
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -4556,6 +4575,7 @@ export class Sync extends HeyApiClient {
             { in: "body", key: "sessionID" },
             { in: "body", key: "seq" },
             { in: "body", key: "warpID" },
+            { in: "body", key: "ownerID" },
           ],
         },
       ],
