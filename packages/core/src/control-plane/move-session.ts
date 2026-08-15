@@ -138,7 +138,7 @@ const layer = Layer.effect(
         SessionEvent.Moved,
         {
           sessionID: input.sessionID,
-          location: Location.Ref.make({ directory }),
+          location: Location.Ref.make({ directory, workspaceID: current.location.workspaceID }),
           subdirectory: RelativePath.make(path.relative(destination.directory, directory).replaceAll("\\", "/")),
           timestamp: yield* DateTime.now,
         },
