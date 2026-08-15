@@ -4,13 +4,12 @@ import { Slug } from "@opencode-ai/core/util/slug"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import path from "path"
-import { BackgroundJob } from "@/background/job"
 import { Decimal } from "decimal.js"
 import type { ProviderMetadata, Usage } from "@opencode-ai/llm"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { EventV2 } from "@opencode-ai/core/event"
+import { EventV2, OwnerFenceError } from "@opencode-ai/core/event"
 import { SessionV2 } from "@opencode-ai/core/session"
 import * as SessionExecutionLocal from "@opencode-ai/core/session/execution/local"
 import { locationServiceMapLayer } from "@opencode-ai/core/location-services"
@@ -30,6 +29,7 @@ import type { SQL } from "drizzle-orm"
 import { PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { MessageV2 } from "./message-v2"
+import { SessionRunState } from "./run-state"
 import type { InstanceContext } from "../project/instance-context"
 import { InstanceState } from "@/effect/instance-state"
 import { Snapshot } from "@/snapshot"
@@ -39,7 +39,7 @@ import { SessionID, MessageID, PartID } from "./schema"
 
 import type { Provider } from "@/provider/provider"
 import { Global } from "@opencode-ai/core/global"
-import { Effect, Layer, Option, Context, Schema, Types } from "effect"
+import { Cause, Effect, Layer, Option, Context, Schema, Types } from "effect"
 import { NonNegativeInt, optional } from "@opencode-ai/core/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -456,7 +456,7 @@ export interface Interface {
   readonly messages: (input: { sessionID: SessionID; limit?: number }) => Effect.Effect<SessionV1.WithParts[], NotFound>
   readonly children: (parentID: SessionID) => Effect.Effect<Info[]>
   readonly remove: (sessionID: SessionID) => Effect.Effect<void, NotFound>
-  readonly updateMessage: <T extends SessionV1.Info>(msg: T) => Effect.Effect<T>
+  readonly updateMessage: <T extends SessionV1.Info>(msg: T) => Effect.Effect<T, NotFound>
   readonly removeMessage: (input: { sessionID: SessionID; messageID: MessageID }) => Effect.Effect<MessageID>
   readonly removePart: (input: { sessionID: SessionID; messageID: MessageID; partID: PartID }) => Effect.Effect<PartID>
   readonly getPart: (input: {
@@ -464,7 +464,7 @@ export interface Interface {
     messageID: MessageID
     partID: PartID
   }) => Effect.Effect<SessionV1.Part | undefined>
-  readonly updatePart: <T extends SessionV1.Part>(part: T) => Effect.Effect<T>
+  readonly updatePart: <T extends SessionV1.Part>(part: T) => Effect.Effect<T, NotFound>
   readonly updatePartDelta: (input: {
     sessionID: SessionID
     messageID: MessageID
@@ -494,15 +494,15 @@ export type Patch = Omit<Partial<Info>, "time" | "share" | "summary" | "revert" 
 const layer: Layer.Layer<
   Service,
   never,
-  BackgroundJob.Service | RuntimeFlags.Service | Database.Service | EventV2Bridge.Service
+  RuntimeFlags.Service | Database.Service | EventV2Bridge.Service | SessionRunState.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
     const { db } = yield* Database.Service
     const database = yield* Database.Service
-    const background = yield* BackgroundJob.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const runState = yield* SessionRunState.Service
 
     const createNext = Effect.fn("Session.createNext")(function* (input: {
       id?: SessionID
@@ -613,53 +613,97 @@ const layer: Layer.Layer<
 
     const remove: Interface["remove"] = Effect.fnUntraced(function* (sessionID: SessionID) {
       const session = yield* get(sessionID)
-      try {
-        // `remove` needs to work in all cases, such as broken sessions that
-        // run cleanup without instance state.
-        const hasInstance = yield* InstanceState.directory.pipe(
-          Effect.as(true),
-          Effect.catchCause(() => Effect.succeed(false)),
-        )
+      // `remove` needs to work in all cases, such as broken sessions that
+      // run cleanup without instance state.
+      const hasInstance = yield* InstanceState.directory.pipe(
+        Effect.as(true),
+        Effect.catchCause(() => Effect.succeed(false)),
+      )
 
-        if (hasInstance) yield* cancelBackgroundJobs(background, sessionID)
-        const kids = yield* children(sessionID)
-        for (const child of kids) {
-          yield* remove(child.id)
-        }
-
-        yield* events.publish(
-          SessionV1.Event.Deleted,
-          { sessionID, info: session },
-          { ownerID: ownerOf(session), strictOwner: true },
-        )
-        yield* events.remove(sessionID)
-      } catch (error) {
-        yield* Effect.logError("failed to remove session", { sessionID, error })
+      if (hasInstance) {
+        // Quiesce in-flight writers before removing state: cancel the
+        // session's active execution (prompt/runner + background jobs) so
+        // interrupt cleanup (processor cleanup / finalizeInterruptedAssistant)
+        // completes while the session still exists. Mirrors how warp cancels
+        // local prompts before transferring ownership.
+        yield* runState.cancel(sessionID)
       }
+
+      // Serialize deletion with concurrent writers under the aggregate lock
+      // and validate ownership before any child deletion: a writer that
+      // passes its existence check before us publishes first (and its rows
+      // are removed by our cascade), while a writer that runs after us sees
+      // the session as gone and fails typed instead of publishing into a
+      // removed aggregate. The fenced remove below dies with
+      // OwnerFenceError on owner mismatch, so a foreign owner cannot
+      // partially delete children and then fail.
+      yield* events
+        .exclusive(
+          sessionID,
+          Effect.gen(function* () {
+            const kids = yield* children(sessionID)
+            for (const child of kids) {
+              yield* remove(child.id)
+            }
+            yield* events.publish(
+              SessionV1.Event.Deleted,
+              { sessionID, info: session },
+              { ownerID: ownerOf(session), strictOwner: true },
+            )
+            // The fenced remove's tombstone branch keeps the sequence row (so
+            // stale replays die at seq 0) while deleting the durable Deleted
+            // event and all other events of this aggregate.
+            yield* events.remove(sessionID, EventV2.strictOwner(ownerOf(session)))
+          }),
+        )
+        .pipe(
+          // A native try/catch does not catch Effect dies, so the old wrapper
+          // silently swallowed OwnerFenceError and reported success. Narrow
+          // the catch to non-fence failures and re-die fence errors so
+          // deletion cannot falsely report success.
+          Effect.catchAllCause((cause) =>
+            Effect.gen(function* () {
+              if (Cause.isDieType(cause) && cause.defect instanceof OwnerFenceError) {
+                yield* Effect.die(cause.defect)
+              }
+              yield* Effect.logError("failed to remove session", { sessionID, cause })
+            }),
+          ),
+        )
     })
 
-    const updateMessage = <T extends SessionV1.Info>(msg: T): Effect.Effect<T> =>
+    const updateMessage = <T extends SessionV1.Info>(msg: T): Effect.Effect<T, NotFound> =>
       Effect.gen(function* () {
-        const current = yield* get(msg.sessionID).pipe(Effect.orDie)
-        yield* events.publish(
-          SessionV1.Event.MessageUpdated,
-          { sessionID: msg.sessionID, info: msg },
-          { ownerID: ownerOf(current), strictOwner: true },
+        yield* events.exclusive(
+          msg.sessionID,
+          Effect.gen(function* () {
+            const current = yield* get(msg.sessionID)
+            yield* events.publish(
+              SessionV1.Event.MessageUpdated,
+              { sessionID: msg.sessionID, info: msg },
+              { ownerID: ownerOf(current), strictOwner: true },
+            )
+          }),
         )
         return msg
       }).pipe(Effect.withSpan("Session.updateMessage"))
 
-    const updatePart = <T extends SessionV1.Part>(part: T): Effect.Effect<T> =>
+    const updatePart = <T extends SessionV1.Part>(part: T): Effect.Effect<T, NotFound> =>
       Effect.gen(function* () {
-        const current = yield* get(part.sessionID).pipe(Effect.orDie)
-        yield* events.publish(
-          SessionV1.Event.PartUpdated,
-          {
-            sessionID: part.sessionID,
-            part: structuredClone(part),
-            time: Date.now(),
-          },
-          { ownerID: ownerOf(current), strictOwner: true },
+        yield* events.exclusive(
+          part.sessionID,
+          Effect.gen(function* () {
+            const current = yield* get(part.sessionID)
+            yield* events.publish(
+              SessionV1.Event.PartUpdated,
+              {
+                sessionID: part.sessionID,
+                part: structuredClone(part),
+                time: Date.now(),
+              },
+              { ownerID: ownerOf(current), strictOwner: true },
+            )
+          }),
         )
         return part
       }).pipe(Effect.withSpan("Session.updatePart"))
@@ -985,23 +1029,6 @@ const layer: Layer.Layer<
   }),
 )
 
-const cancelBackgroundJobs = Effect.fn("Session.cancelBackgroundJobs")(function* (
-  background: BackgroundJob.Interface,
-  sessionID: SessionID,
-) {
-  const jobs = yield* background.list()
-  yield* Effect.forEach(
-    jobs.filter((job) => {
-      if (job.status !== "running") return false
-      if (job.id === sessionID) return true
-      if (job.metadata?.sessionId === sessionID) return true
-      return job.metadata?.parentSessionId === sessionID
-    }),
-    (job) => background.cancel(job.id),
-    { concurrency: "unbounded", discard: true },
-  )
-})
-
 function listByProject(
   db: Database.Interface["db"],
   input: ListInput & {
@@ -1060,7 +1087,7 @@ function listByProject(
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node],
+  deps: [RuntimeFlags.node, Database.node, EventV2Bridge.node, SessionRunState.node],
 })
 
 export * as Session from "./session"
