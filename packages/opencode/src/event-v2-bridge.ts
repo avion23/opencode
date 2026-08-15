@@ -24,6 +24,8 @@ const layer = Layer.effect(
         const workspaceID = yield* WorkspaceRef
         return yield* events.publish(definition, data, {
           ...options,
+          // Core SessionEvent call sites supply explicit owners for strict fencing;
+          // this non-strict bridge fallback is only for legacy routing metadata.
           ownerID: options?.ownerID ?? workspaceID ?? ctx.project.id,
           location: new Location.Info({
             directory: AbsolutePath.make(ctx.directory),

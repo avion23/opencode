@@ -245,6 +245,8 @@ export const Info = Schema.Struct({
 }).annotate({ identifier: "Session" })
 export type Info = Types.DeepMutable<Schema.Schema.Type<typeof Info>>
 
+const ownerOf = (session: Pick<Info, "workspaceID" | "projectID">) => session.workspaceID ?? session.projectID
+
 export const ProjectInfo = Schema.Struct({
   id: ProjectV2.ID,
   name: optional(Schema.String),
@@ -628,7 +630,7 @@ const layer: Layer.Layer<
         yield* events.publish(
           SessionV1.Event.Deleted,
           { sessionID, info: session },
-          { ownerID: session.workspaceID, strictOwner: true },
+          { ownerID: ownerOf(session), strictOwner: true },
         )
         yield* events.remove(sessionID)
       } catch (error) {
@@ -642,7 +644,7 @@ const layer: Layer.Layer<
         yield* events.publish(
           SessionV1.Event.MessageUpdated,
           { sessionID: msg.sessionID, info: msg },
-          { ownerID: current.workspaceID, strictOwner: true },
+          { ownerID: ownerOf(current), strictOwner: true },
         )
         return msg
       }).pipe(Effect.withSpan("Session.updateMessage"))
@@ -657,7 +659,7 @@ const layer: Layer.Layer<
             part: structuredClone(part),
             time: Date.now(),
           },
-          { ownerID: current.workspaceID, strictOwner: true },
+          { ownerID: ownerOf(current), strictOwner: true },
         )
         return part
       }).pipe(Effect.withSpan("Session.updatePart"))
@@ -768,7 +770,7 @@ const layer: Layer.Layer<
           { sessionID, info: next },
           {
             id: eventID,
-            ownerID: current.workspaceID,
+            ownerID: ownerOf(current),
             strictOwner: true,
           },
         )
@@ -853,7 +855,7 @@ const layer: Layer.Layer<
             sessionID: input.sessionID,
             info: { ...current, workspaceID: input.workspaceID, time: { ...current.time, updated: Date.now() } },
           },
-          { id: input.eventID, ownerID: input.ownerID ?? current.workspaceID, strictOwner: true },
+          { id: input.eventID, ownerID: input.ownerID ?? ownerOf(current), strictOwner: true },
         )
         .pipe(Effect.orDie)
     })
@@ -899,7 +901,7 @@ const layer: Layer.Layer<
           sessionID: input.sessionID,
           messageID: input.messageID,
         },
-        { ownerID: current.workspaceID, strictOwner: true },
+        { ownerID: ownerOf(current), strictOwner: true },
       )
       return input.messageID
     })
@@ -917,7 +919,7 @@ const layer: Layer.Layer<
           messageID: input.messageID,
           partID: input.partID,
         },
-        { ownerID: current.workspaceID, strictOwner: true },
+        { ownerID: ownerOf(current), strictOwner: true },
       )
       return input.partID
     })
