@@ -72,8 +72,6 @@ type Dependencies = {
     readonly stream: (request: LLMRequest) => Stream.Stream<LLMEvent, LLMError>
   }
   readonly config: readonly Config.Entry[]
-  /** Resolves the durable-owner fencing for a Session's compaction appends. */
-  readonly owner: (sessionID: SessionSchema.ID) => Effect.Effect<EventV2.StrictOwner>
 }
 
 type Input = {
@@ -81,6 +79,10 @@ type Input = {
   readonly entries: readonly Entry[]
   readonly model: Model
   readonly request: LLMRequest
+  /** Captured before the provider turn; never reload the owner from the mutable Session projection. */
+  readonly owner: EventV2.StrictOwner
+  /** Checks that the runner still owns the same location immediately before each append. */
+  readonly validateLocation: () => Effect.Effect<void>
 }
 
 const estimate = (value: unknown) => Token.estimate(JSON.stringify(value))
@@ -209,7 +211,7 @@ export const make = (dependencies: Dependencies) => {
     const summaryOutput = Math.min(output || SUMMARY_OUTPUT_TOKENS, SUMMARY_OUTPUT_TOKENS)
     if (Token.estimate(summaryPrompt) > context - summaryOutput) return false
     const messageID = SessionMessage.ID.create()
-    const owner = yield* dependencies.owner(input.sessionID)
+    yield* input.validateLocation()
     yield* dependencies.events.publish(
       SessionEvent.Compaction.Started,
       {
@@ -218,7 +220,7 @@ export const make = (dependencies: Dependencies) => {
         timestamp: yield* DateTime.now,
         reason: "auto",
       },
-      owner,
+      input.owner,
     )
 
     const chunks: string[] = []
@@ -244,6 +246,7 @@ export const make = (dependencies: Dependencies) => {
       )
     const summary = chunks.join("")
     if (!summarized || failed || !summary.trim()) return false
+    yield* input.validateLocation()
     yield* dependencies.events.publish(
       SessionEvent.Compaction.Ended,
       {
@@ -254,7 +257,7 @@ export const make = (dependencies: Dependencies) => {
         text: summary,
         recent: selected.recent,
       },
-      owner,
+      input.owner,
     )
     return true
   })

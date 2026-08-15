@@ -103,7 +103,6 @@ test("compaction invokes the provider when an oversized newest message has a bou
         }),
       }),
     ],
-    owner: () => Effect.succeed(EventV2.strictOwner("compaction-test")),
   })
 
   const result = Effect.runSync(
@@ -112,6 +111,8 @@ test("compaction invokes the provider when an oversized newest message has a bou
       entries,
       model,
       request: LLM.request({ model, messages: [], tools: [], generation: { maxTokens: 4_096 } }),
+      owner: EventV2.strictOwner("compaction-test"),
+      validateLocation: () => Effect.void,
     }),
   )
 

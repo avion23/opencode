@@ -7,6 +7,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
+import { EventTable } from "@opencode-ai/core/event/sql"
 import { Location } from "@opencode-ai/core/location"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
@@ -190,7 +191,6 @@ describe("Session owner fencing", () => {
         events,
         llm: { stream: () => Stream.make(LLMEvent.textDelta({ id: "summary", text: "summary" })) },
         config: [],
-        owner: () => Effect.succeed(EventV2.strictOwner("owner-b")),
       })
       const model = Model.make({
         id: "compaction-fence",
@@ -213,9 +213,73 @@ describe("Session owner fencing", () => {
           entries: [entry(0, "Earlier context"), entry(1, `LATEST_INSTRUCTION ${"x".repeat(76_000)}`)],
           model,
           request,
+          owner: EventV2.strictOwner("owner-b"),
+          validateLocation: () => Effect.void,
         })
         .pipe(Effect.exit)
       expect(Exit.isFailure(exit) && Cause.squash(exit.cause)).toBeInstanceOf(EventV2.OwnerFenceError)
+    }),
+  )
+
+  it.effect("stale compaction revalidates its location before the Ended append", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const sessionID = SessionSchema.ID.make("ses_compaction_moved")
+      const sourceOwner = EventV2.strictOwner("owner-a")
+      yield* events.publish(
+        SessionEvent.Compaction.Started,
+        { sessionID, messageID: SessionMessage.ID.create(), timestamp: yield* DateTime.now, reason: "auto" },
+        sourceOwner,
+      )
+
+      let checks = 0
+      const compaction = SessionCompaction.make({
+        events,
+        llm: { stream: () => Stream.make(LLMEvent.textDelta({ id: "summary", text: "summary" })) },
+        config: [],
+      })
+      const model = Model.make({
+        id: "compaction-moved",
+        provider: "fake",
+        route: OpenAIChat.route.with({ limits: { context: 20_000, output: 4_096 } }),
+      })
+      const entry = (seq: number, text: string) => ({
+        seq,
+        message: SessionMessage.User.make({
+          id: SessionMessage.ID.make(`moved_msg_${seq}`),
+          type: "user",
+          text,
+          time: { created: DateTime.makeUnsafe(0) },
+        }),
+      })
+      const exit = yield* compaction
+        .compactAfterOverflow({
+          sessionID,
+          entries: [entry(0, "Earlier context"), entry(1, `LATEST_INSTRUCTION ${"x".repeat(76_000)}`)],
+          model,
+          request: LLM.request({ model, messages: [], tools: [], generation: { maxTokens: 4_096 } }),
+          owner: sourceOwner,
+          validateLocation: () =>
+            Effect.gen(function* () {
+              checks++
+              if (checks === 2) {
+                yield* events.claim(sessionID, "owner-b")
+                return yield* Effect.interrupt
+              }
+            }),
+        })
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+      expect(checks).toBe(2)
+      expect(
+        (yield* db
+          .select({ type: EventTable.type })
+          .from(EventTable)
+          .where(eq(EventTable.aggregate_id, sessionID))
+          .all()).map((event) => event.type),
+      ).toEqual(["session.next.compaction.started.1", "session.next.compaction.started.1"])
     }),
   )
 })

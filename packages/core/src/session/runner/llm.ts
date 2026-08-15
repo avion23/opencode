@@ -107,18 +107,15 @@ const layer = Layer.effect(
     const config = yield* Config.Service
     const snapshots = yield* Snapshot.Service
     const db = (yield* Database.Service).db
-    const compaction = SessionCompaction.make({
-      events,
-      llm,
-      config: yield* config.entries(),
-      // Owner fencing is derived from the authoritative session record, never from
-      // the ambient location: a stale runner at an old location must not append.
-      owner: (sessionID) => Effect.map(getSession(sessionID), (session) => EventV2.strictOwner(SessionOwner.ownerOf(session))),
-    })
     const getSession = Effect.fn("SessionRunner.getSession")(function* (sessionID: SessionSchema.ID) {
       const session = yield* store.get(sessionID)
       if (!session) return yield* Effect.die(`Session not found: ${sessionID}`)
       return session
+    })
+    const compaction = SessionCompaction.make({
+      events,
+      llm,
+      config: yield* config.entries(),
     })
 
     const getContext = Effect.fn("SessionRunner.getContext")(function* (sessionID: SessionSchema.ID) {
@@ -239,7 +236,23 @@ const layer = Layer.effect(
         tools: toolMaterialization?.definitions ?? [],
         toolChoice: isLastStep ? "none" : undefined,
       })
-      if (yield* compaction.compactIfNeeded({ sessionID: session.id, entries, model, request }))
+      const compactionInput = {
+        sessionID: session.id,
+        entries,
+        model,
+        request,
+        owner,
+        validateLocation: () =>
+          Effect.gen(function* () {
+            const current = yield* getSession(session.id)
+            if (
+              current.location.directory !== location.directory ||
+              current.location.workspaceID !== location.workspaceID
+            )
+              return yield* Effect.interrupt
+          }),
+      }
+      if (yield* compaction.compactIfNeeded(compactionInput))
         return yield* Effect.die(continueAfterCompaction(currentStep))
       const startSnapshot = yield* snapshots.capture()
       const publisher = createLLMEventPublisher(events, {
@@ -311,7 +324,7 @@ const layer = Layer.effect(
             recoverOverflow &&
             !publisher.hasAssistantStarted() &&
             isContextOverflowFailure(overflowFailure ?? failure) &&
-            (yield* restore(recoverOverflow({ sessionID: session.id, entries, model, request })))
+            (yield* restore(recoverOverflow(compactionInput)))
           )
             return yield* Effect.die(continueAfterOverflowCompaction(currentStep))
           if (overflowFailure) yield* publish(overflowFailure)
