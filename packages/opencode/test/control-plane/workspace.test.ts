@@ -6,7 +6,7 @@ import path from "node:path"
 import { NodeHttpServer } from "@effect/platform-node"
 import { Context, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
 import { HttpBody, HttpClient, HttpClientResponse, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
-import { eq } from "drizzle-orm"
+import { and, eq } from "drizzle-orm"
 import { GlobalBus, type GlobalEvent } from "@/bus/global"
 import { Project } from "@/project/project"
 import { Database } from "@opencode-ai/core/database/database"
@@ -21,6 +21,7 @@ import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, provideTmpdirInstance, requireInstance, TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
+import { memoMap } from "@opencode-ai/core/effect/memo-map"
 import { registerAdapter } from "../../src/control-plane/adapters"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { WorkspaceTable } from "@opencode-ai/core/control-plane/workspace.sql"
@@ -837,7 +838,7 @@ describe("workspace CRUD", () => {
             expect(
               calls.map((call) => `${call.method} ${call.url.pathname}${call.url.search}${call.url.hash}`),
             ).toEqual(["GET /base/global/event", "POST /base/sync/history"])
-            expect(calls[1].json).toEqual({})
+            expect(calls[1].json).toEqual({ scope: "aggregate", state: {} })
             expect((yield* workspace.status()).find((item) => item.workspaceID === info.id)?.status).toBe("connected")
             expect(yield* workspace.isSyncing(info.id)).toBe(true)
 
@@ -1742,8 +1743,7 @@ describe("workspace CRUD", () => {
               const state = (body as { state?: Record<string, number> }).state ?? {}
               return yield* HttpServerResponse.json(
                 destinationEvents.filter(
-                  (event) =>
-                    event.aggregate_id === Object.keys(state)[0]! && event.seq > Number(Object.values(state)[0]),
+                  (event) => event.aggregate_id in state && event.seq > Number(state[event.aggregate_id]),
                 ),
               )
             }
@@ -1828,6 +1828,22 @@ describe("workspace CRUD", () => {
               const target = workspaceInfo(instance.project.id, targetType, { directory: destinationDirectory })
               destinationWorkspaceID = target.id
               yield* insertWorkspace(target)
+              // HttpApiApp.webHandler() resolves its services through the process-global
+              // memoMap, so the handler's Database is a different in-memory instance than
+              // the isolated test layer's. Seed the workspace row into that shared Database
+              // so the handler's currentScope() accepts the replay/steal requests. The
+              // context is built on the test's scope (kept alive for the whole test) so the
+              // memoized Database is not evicted before the lazily-built handler reuses it.
+              // EventV2/Session stay isolated: sharing them would deadlock on the
+              // per-aggregate exclusive lock the client's sessionWarp holds during handoff.
+              yield* Layer.buildWithMemoMap(AppNodeBuilder.build(Database.node), memoMap, yield* Effect.scope).pipe(
+                Effect.flatMap((sharedCtx) =>
+                  insertProject(instance.project.id, instance.project.worktree).pipe(
+                    Effect.provide(sharedCtx),
+                    Effect.andThen(insertWorkspace(target).pipe(Effect.provide(sharedCtx))),
+                  ),
+                ),
+              )
               registerAdapter(instance.project.id, targetType, remoteAdapter(`${url}/real-target`).adapter)
               const session = yield* sessionSvc.create({})
 
@@ -1878,7 +1894,48 @@ describe("workspace CRUD", () => {
     }),
   )
 
-  it.live("sessionWarp refuses a non-replayable session before remote side effects", () => {
+  it.live("sessionWarp refuses a removed session (tombstone) before side effects", () => {
+    return provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const workspace = yield* Workspace.Service
+          const sessionSvc = yield* SessionNs.Service
+          const instance = yield* requireInstance
+          const type = unique("warp-removed")
+          const target = workspaceInfo(instance.project.id, type)
+          yield* insertWorkspace(target)
+          // Local destination: session.touch is skipped for non-remote targets,
+          // so the tombstone (sequence row kept, event rows gone) reaches the
+          // replay snapshot unchanged and is rejected as removed.
+          registerAdapter(instance.project.id, type, localAdapter(path.join(dir, "warp-removed-local")).adapter)
+          const session = yield* sessionSvc.create({})
+          yield* sessionSvc.setTitle({ sessionID: session.id, title: "titled" })
+          const { db } = yield* Database.Service
+          // Tombstone: the sequence row remains but every event row is gone.
+          yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, session.id)).run().pipe(Effect.orDie)
+
+          const error = yield* Effect.flip(
+            workspace.sessionWarp({ workspaceID: target.id, sessionID: session.id, copyChanges: true }),
+          )
+
+          expect(error).toMatchObject({
+            _tag: "WorkspaceSessionRemovedError",
+            sessionID: session.id,
+          })
+          expect(
+            (yield* db
+              .select({ workspaceID: SessionTable.workspace_id })
+              .from(SessionTable)
+              .where(eq(SessionTable.id, session.id))
+              .get()
+              .pipe(Effect.orDie))?.workspaceID,
+          ).toBeNull()
+        }),
+      { git: true },
+    )
+  })
+
+  it.live("sessionWarp refuses a session with a genuine event gap before remote side effects", () => {
     const calls: FetchCall[] = []
     return Effect.gen(function* () {
       yield* HttpServer.serveEffect()(
@@ -1902,13 +1959,19 @@ describe("workspace CRUD", () => {
             const workspace = yield* Workspace.Service
             const sessionSvc = yield* SessionNs.Service
             const instance = yield* requireInstance
-            const type = unique("warp-non-replayable")
+            const type = unique("warp-gap")
             const target = workspaceInfo(instance.project.id, type)
             yield* insertWorkspace(target)
             registerAdapter(instance.project.id, type, remoteAdapter(`${url}/warp-target`).adapter)
             const session = yield* sessionSvc.create({})
+            yield* sessionSvc.setTitle({ sessionID: session.id, title: "titled" })
             const { db } = yield* Database.Service
-            yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, session.id)).run().pipe(Effect.orDie)
+            // Genuine gap: two events (seq 0, 1); delete only the seq-0 row.
+            yield* db
+              .delete(EventTable)
+              .where(and(eq(EventTable.aggregate_id, session.id), eq(EventTable.seq, 0)))
+              .run()
+              .pipe(Effect.orDie)
 
             const error = yield* Effect.flip(
               workspace.sessionWarp({ workspaceID: target.id, sessionID: session.id, copyChanges: true }),

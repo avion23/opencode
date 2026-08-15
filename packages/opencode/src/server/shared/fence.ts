@@ -1,5 +1,6 @@
 import { Database } from "@opencode-ai/core/database/database"
 import { inArray } from "drizzle-orm"
+import { EventV2 } from "@opencode-ai/core/event"
 import { EventSequenceTable } from "@opencode-ai/core/event/sql"
 import { Workspace } from "@/control-plane/workspace"
 import type { WorkspaceV2 } from "@opencode-ai/core/workspace"
@@ -16,7 +17,12 @@ export function load(db: Database.Interface["db"], ids?: string[]) {
         : db.select().from(EventSequenceTable).all()
     ).pipe(Effect.orDie)
 
-    return Object.fromEntries(rows.map((row) => [row.aggregate_id, row.seq]))
+    const states: State = {}
+    for (const row of rows) {
+      if (!(yield* EventV2.hasEvents(db, row.aggregate_id))) continue
+      states[row.aggregate_id] = row.seq
+    }
+    return states
   })
 }
 

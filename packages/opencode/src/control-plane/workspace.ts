@@ -117,6 +117,14 @@ export class SessionEventsNotReplayableError extends Schema.TaggedErrorClass<Ses
   },
 ) {}
 
+export class SessionRemovedError extends Schema.TaggedErrorClass<SessionRemovedError>()(
+  "WorkspaceSessionRemovedError",
+  {
+    message: Schema.String,
+    sessionID: SessionID,
+  },
+) {}
+
 export class SessionWarpConflictError extends Schema.TaggedErrorClass<SessionWarpConflictError>()(
   "WorkspaceSessionWarpConflictError",
   {
@@ -152,6 +160,7 @@ type SessionWarpError =
   | SessionWarpAuthorizationError
   | SessionEventsNotFoundError
   | SessionEventsNotReplayableError
+  | SessionRemovedError
   | SessionWarpConflictError
   | SessionWarpHttpError
   | Vcs.PatchApplyError
@@ -699,6 +708,11 @@ const layer = Layer.effect(
           }),
         )
         .pipe(Effect.orDie)
+      if (snapshot.latest !== undefined && snapshot.rows.length === 0)
+        return yield* new SessionRemovedError({
+          message: `Session was removed and is not replayable: ${sessionID}`,
+          sessionID,
+        })
       if (
         snapshot.latest === undefined ||
         snapshot.rows.length !== snapshot.latest + 1 ||
