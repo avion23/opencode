@@ -1187,7 +1187,7 @@ describe("SessionRunnerLLM", () => {
     }),
   )
 
-  it.effect("summarizes an oversized newest message without retaining a fragment", () =>
+  it.effect("summarizes an oversized newest message while retaining its exact suffix", () =>
     Effect.gen(function* () {
       yield* setup
       const session = yield* SessionV2.Service
@@ -1209,10 +1209,10 @@ describe("SessionRunnerLLM", () => {
       const summary = userTexts(requests[0])[0]
       const continuation = userTexts(requests[1])[0]
       expect(summary.match(/OVERSIZED_BOUNDARY/g)).toHaveLength(1)
-      expect(summary).toContain(oversized)
+      expect(summary).not.toContain("OVERSIZED_END")
       expect(continuation).not.toContain("OVERSIZED_BOUNDARY")
-      expect(continuation).not.toContain("OVERSIZED_END")
-      expect(continuation).toContain("<recent-context>\n\n</recent-context>")
+      expect(continuation).toContain("OVERSIZED_END")
+      expect(continuation).toContain("<recent-context>\n")
     }),
   )
 

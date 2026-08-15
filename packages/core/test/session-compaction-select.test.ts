@@ -15,16 +15,22 @@ const entry = (seq: number, text: string) => ({
   }),
 })
 
-test("compaction split does not duplicate the straddling message into the head", () => {
-  // "c" alone exceeds the token budget, so the split point never enters it:
-  // it stays whole in `head` for summarization and no fragment of it is
-  // retained in `recent`. The full message must appear exactly once.
-  const large = "c".repeat(80_000)
-  const selected = SessionCompaction.select([entry(0, "a".repeat(400)), entry(1, "b".repeat(400)), entry(2, large)], 8000)
+test("compaction split keeps a bounded suffix of an oversized message exactly once", () => {
+  const large = `OVERSIZED_START ${"c".repeat(80_000)} OVERSIZED_END`
+  const selected = SessionCompaction.select([entry(0, "a".repeat(400)), entry(1, large)], 8000)
 
   expect(selected).toBeDefined()
-  expect(selected!.head).toBe(`[User]: ${"a".repeat(400)}\n\n[User]: ${"b".repeat(400)}\n\n[User]: ${large}`)
-  expect(selected!.recent).toBe("")
+  expect(selected!.recent).toBe(`[User]: ${large}`.slice(-32_000))
+  expect(selected!.recent.length).toBe(32_000)
+  expect(selected!.head).toContain(`[User]: ${"a".repeat(400)}`)
+  expect(selected!.head).toContain("OVERSIZED_START")
+  expect(selected!.head).not.toContain("OVERSIZED_END")
+
+  const currentPrefix = selected!.head.slice(selected!.head.lastIndexOf("[User]:"))
+  const reconstructed = currentPrefix + selected!.recent
+  expect(reconstructed).toBe(`[User]: ${large}`)
+  expect(reconstructed.split(large)).toHaveLength(2)
+  expect(selected!.head + selected!.recent).toBe(`[User]: ${"a".repeat(400)}\n\n[User]: ${large}`)
 })
 
 test("compaction split keeps everything in recent when the conversation fits the budget", () => {
