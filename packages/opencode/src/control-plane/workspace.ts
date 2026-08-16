@@ -522,15 +522,27 @@ const layer = Layer.effect(
               if (payload.type === "server.heartbeat") return
 
               if (payload.type === "sync" && payload.syncEvent) {
-                const failed = yield* events.replay(payload.syncEvent, { publish: true, ownerID: space.id }).pipe(
-                  Effect.as(false),
-                  Effect.catchCause((error) =>
-                    Effect.logWarning("failed to replay global event", error).pipe(
-                      Effect.annotateLogs({ workspaceID: space.id }),
-                      Effect.as(true),
+                // Replay under the aggregate's current durable owner (falling
+                // back to the workspace) so owner-fenced forwarding of this
+                // session's own events is never silently dropped — mirroring
+                // the syncHistory replay path.
+                const durableOwner = yield* db
+                  .select({ ownerID: EventSequenceTable.owner_id })
+                  .from(EventSequenceTable)
+                  .where(eq(EventSequenceTable.aggregate_id, payload.syncEvent.aggregateID))
+                  .get()
+                  .pipe(Effect.orDie)
+                const failed = yield* events
+                  .replay(payload.syncEvent, { publish: true, ownerID: durableOwner?.ownerID ?? space.id })
+                  .pipe(
+                    Effect.as(false),
+                    Effect.catchCause((error) =>
+                      Effect.logWarning("failed to replay global event", error).pipe(
+                        Effect.annotateLogs({ workspaceID: space.id }),
+                        Effect.as(true),
+                      ),
                     ),
-                  ),
-                )
+                  )
                 if (failed) return
               }
 
