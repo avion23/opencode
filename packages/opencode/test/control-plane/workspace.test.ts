@@ -4,7 +4,7 @@ import fs from "node:fs/promises"
 import Http from "node:http"
 import path from "node:path"
 import { NodeHttpServer } from "@effect/platform-node"
-import { Context, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
 import { HttpBody, HttpClient, HttpClientResponse, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { and, eq } from "drizzle-orm"
 import { GlobalBus, type GlobalEvent } from "@/bus/global"
@@ -1231,6 +1231,13 @@ describe("workspace CRUD", () => {
             registerAdapter(instance.project.id, targetType, remoteAdapter(`${url}/warp-target`).adapter)
             const session = yield* sessionSvc.create({})
             yield* attachSessionToWorkspace(session.id, previous.id)
+            // The injected concurrent setTitle publishes under previous.id (the
+            // session row's owner after attach); claim the durable sequence row
+            // to previous.id so the injected update lands and the phase-3
+            // sequence re-check fires the expected conflict instead of the
+            // owner fence silently dropping it.
+            const events = yield* EventV2.Service
+            yield* events.claim(session.id, previous.id)
             historySessionID = session.id
             historySession = { ...session, workspaceID: previous.id, title: "from source history" }
             historyNextSeq = ((yield* sessionSequence(session.id)) ?? -1) + 1
@@ -1490,7 +1497,11 @@ describe("workspace CRUD", () => {
               const writeExit = yield* sessionSvc
                 .setTitle({ sessionID: session.id, title: "after timeout" })
                 .pipe(Effect.exit)
-              expectExitContains(writeExit, "InvalidDurableEvent", "Local owner mismatch")
+              expect(Exit.isFailure(writeExit)).toBe(true)
+              if (Exit.isFailure(writeExit)) {
+                expect(Cause.hasDies(writeExit.cause)).toBe(true)
+                expect(Cause.squash(writeExit.cause)).toBeInstanceOf(EventV2.OwnerFenceError)
+              }
               expect(yield* sessionSequence(session.id)).toBe(seqBefore)
               expect((yield* sessionSvc.get(session.id)).title).toBe(titleBefore)
               expect(yield* sessionEventCount(session.id)).toBe(rowsBefore)
@@ -1554,7 +1565,11 @@ describe("workspace CRUD", () => {
               const writeExit = yield* sessionSvc
                 .setTitle({ sessionID: session.id, title: "after interruption" })
                 .pipe(Effect.exit)
-              expectExitContains(writeExit, "InvalidDurableEvent", "Local owner mismatch")
+              expect(Exit.isFailure(writeExit)).toBe(true)
+              if (Exit.isFailure(writeExit)) {
+                expect(Cause.hasDies(writeExit.cause)).toBe(true)
+                expect(Cause.squash(writeExit.cause)).toBeInstanceOf(EventV2.OwnerFenceError)
+              }
               expect(yield* sessionSequence(session.id)).toBe(seqBefore)
               expect((yield* sessionSvc.get(session.id)).title).toBe(titleBefore)
               expect(yield* sessionEventCount(session.id)).toBe(rowsBefore)
@@ -1734,8 +1749,11 @@ describe("workspace CRUD", () => {
                   workspaceID: destinationWorkspaceID!,
                   time: { ...info.time, updated: Date.now() },
                 }
+                // Commit under the client's real warpID: the merged tree's
+                // isCommittedSessionWarp requires event.id === warpID, so a
+                // random id would never be adopted as the prior-attempt commit.
                 destinationEvents.push({
-                  id: EventV2.ID.create(),
+                  id: body.warpID! as EventV2.ID,
                   aggregate_id: body.sessionID!,
                   seq: Number(body.seq) + 1,
                   type: "session.updated.1",

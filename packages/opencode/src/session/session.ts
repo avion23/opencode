@@ -678,14 +678,22 @@ const layer: Layer.Layer<
 
     const updateMessage = <T extends SessionV1.Info>(msg: T): Effect.Effect<T, NotFound> =>
       Effect.gen(function* () {
+        // Capture the owner under which this write was issued *before* acquiring
+        // the exclusive lock. If a warp replay moves the session to a new owner
+        // while this writer waits for the lock, the write must still be fenced to
+        // the owner that issued it so the fence correctly rejects it.
+        const owner = ownerOf(yield* get(msg.sessionID))
         yield* events.exclusive(
           msg.sessionID,
           Effect.gen(function* () {
-            const current = yield* get(msg.sessionID)
+            // Re-read under the lock purely as a liveness/fence check: a
+            // concurrent remove must fail this writer typed NotFound instead of
+            // resurrecting the aggregate.
+            yield* get(msg.sessionID)
             yield* events.publish(
               SessionV1.Event.MessageUpdated,
               { sessionID: msg.sessionID, info: msg },
-              { ownerID: ownerOf(current), strictOwner: true },
+              { ownerID: owner, strictOwner: true },
             )
           }),
         )
@@ -694,10 +702,16 @@ const layer: Layer.Layer<
 
     const updatePart = <T extends SessionV1.Part>(part: T): Effect.Effect<T, NotFound> =>
       Effect.gen(function* () {
+        // Capture the owner under which this write was issued *before* acquiring
+        // the exclusive lock (see updateMessage).
+        const owner = ownerOf(yield* get(part.sessionID))
         yield* events.exclusive(
           part.sessionID,
           Effect.gen(function* () {
-            const current = yield* get(part.sessionID)
+            // Re-read under the lock purely as a liveness/fence check: a
+            // concurrent remove must fail this writer typed NotFound instead of
+            // resurrecting the aggregate.
+            yield* get(part.sessionID)
             yield* events.publish(
               SessionV1.Event.PartUpdated,
               {
@@ -705,7 +719,7 @@ const layer: Layer.Layer<
                 part: structuredClone(part),
                 time: Date.now(),
               },
-              { ownerID: ownerOf(current), strictOwner: true },
+              { ownerID: owner, strictOwner: true },
             )
           }),
         )
@@ -803,6 +817,9 @@ const layer: Layer.Layer<
 
     const patch = (sessionID: SessionID, info: Patch, eventID?: EventV2.ID) =>
       Effect.gen(function* () {
+        // Capture the owner under which this write was issued *before* acquiring
+        // the exclusive lock (see updateMessage).
+        const owner = ownerOf(yield* get(sessionID))
         // Serialize with deletion and other writers under the aggregate lock:
         // a concurrent remove must not observe a half-published update, and a
         // writer running after remove fails typed on the missing session
@@ -825,7 +842,7 @@ const layer: Layer.Layer<
               { sessionID, info: next },
               {
                 id: eventID,
-                ownerID: ownerOf(current),
+                ownerID: owner,
                 strictOwner: true,
               },
             )

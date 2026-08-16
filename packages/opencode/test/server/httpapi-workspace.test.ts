@@ -447,6 +447,32 @@ describe("workspace HttpApi", () => {
         const url = new URL(request.url)
         if (url.pathname === "/base/global/event") return eventStreamResponse()
         if (url.pathname === "/base/sync/history") return Response.json([])
+        // The warp flow strictly decodes these responses: replay must name the
+        // warped session and steal must return the protocol-valid committed
+        // warp event (id === warpID, seq === body.seq + 1, session.updated.1,
+        // workspaceID in info) or the client rejects the steal and the warp
+        // never commits.
+        if (url.pathname === "/base/sync/replay") return Response.json({ sessionID: session.id })
+        if (url.pathname === "/base/sync/steal") {
+          const payload = JSON.parse(request.body) as { sessionID: string; seq: number; warpID: string }
+          return Response.json({
+            sessionID: payload.sessionID,
+            event: {
+              id: payload.warpID,
+              aggregateID: payload.sessionID,
+              seq: payload.seq + 1,
+              type: "session.updated.1",
+              data: {
+                sessionID: payload.sessionID,
+                info: {
+                  ...session,
+                  workspaceID: workspace.id,
+                  time: { ...session.time, updated: Date.now() },
+                },
+              },
+            },
+          })
+        }
         return Response.json({ proxied: true, path: new URL(request.url).pathname })
       })
 
