@@ -1408,6 +1408,7 @@ describe("workspace CRUD", () => {
           Effect.gen(function* () {
             const workspace = yield* Workspace.Service
             const sessionSvc = yield* SessionNs.Service
+            const events = yield* EventV2.Service
             const instance = yield* requireInstance
             const previousType = unique("warp-steal-source")
             const targetType = unique("warp-steal-target")
@@ -1419,6 +1420,11 @@ describe("workspace CRUD", () => {
             registerAdapter(instance.project.id, targetType, remoteAdapter(`${url}/warp-target`).adapter)
             const session = yield* sessionSvc.create({})
             yield* attachSessionToWorkspace(session.id, previous.id)
+            // The injected source event is replayed under the source workspace
+            // (sourceOwner), so the source must own the durable sequence row or
+            // the owner fence silently drops the replay and the warp's sequence
+            // re-check never fires (matching the session-owner-fencing pattern).
+            yield* events.claim(session.id, previous.id)
             sourceOwner = previous.id
             sourceEvent = {
               id: EventV2.ID.create(),
