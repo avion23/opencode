@@ -437,7 +437,7 @@ describe("delete-race regression", () => {
     }),
   )
 
-  it.instance("stale seq-0 replay dies once the owned tombstone is engaged", () =>
+  it.instance("stale seq-0 replay is an idempotent no-op once the owned tombstone is engaged", () =>
     Effect.gen(function* () {
       const session = yield* SessionNs.Service
       const events = yield* EventV2Bridge.Service
@@ -459,14 +459,16 @@ describe("delete-race regression", () => {
         data,
       }
 
+      // A stale in-range replay (seq 0 within the tombstone's retained fence
+      // sequence 1) is an idempotent no-op: it neither dies nor resurrects the
+      // removed aggregate. This preserves at-least-once re-delivery safety —
+      // the delete-race guard is that the replay must NOT recreate event rows.
       const exit = yield* events
         .replay(serialized, { ownerID: "global", strictOwner: true })
         .pipe(Effect.exit)
-      expect(Exit.isFailure(exit)).toBe(true)
-      if (Exit.isFailure(exit)) {
-        expect(Cause.hasDies(exit.cause)).toBe(true)
-      }
+      expect(Exit.isSuccess(exit)).toBe(true)
       expect(yield* eventRows(info.id)).toHaveLength(0)
+      expect(yield* sessionSequenceRow(info.id)).toEqual({ seq: 1, ownerID: "global" })
     }),
   )
 

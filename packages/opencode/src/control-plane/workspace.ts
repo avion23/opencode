@@ -407,6 +407,21 @@ const layer = Layer.effect(
               .pipe(Effect.orDie)).map((row) => [row.aggregate_id, row.seq]),
           )
         : {}
+      // Replay each drained event under the aggregate's current durable owner
+      // (falling back to the workspace) so owner-fenced forwarding of this
+      // session's own history is never silently dropped. A fresh session's
+      // sequence row is stamped with its project owner (ownerOf), which differs
+      // from the source workspace id used for the fence here.
+      const ownerByAggregate = sessionIDs.length
+        ? Object.fromEntries(
+            (yield* db
+              .select()
+              .from(EventSequenceTable)
+              .where(inArray(EventSequenceTable.aggregate_id, sessionIDs))
+              .all()
+              .pipe(Effect.orDie)).map((row) => [row.aggregate_id, row.owner_id]),
+          )
+        : {}
 
       const payload: HistoryRequest =
         request.scope === "workspace"
@@ -463,7 +478,7 @@ const layer = Layer.effect(
                 type: event.type,
                 data: event.data,
               },
-              { publish: true, ownerID: replayOwnerID },
+              { publish: true, ownerID: ownerByAggregate[event.aggregate_id] ?? replayOwnerID },
             )
             .pipe(Effect.provideService(WorkspaceRef, replayOwnerID)),
         { discard: true },
