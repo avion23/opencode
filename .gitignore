@@ -38,3 +38,4 @@ logs/
 tsconfig.tsbuildinfo
 /artifacts/
 .opencode/
+handoff.md
