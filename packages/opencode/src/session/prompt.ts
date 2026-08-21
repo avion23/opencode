@@ -1345,7 +1345,23 @@ const layer = Layer.effect(
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts, NotFoundError> = Effect.fn(
       "SessionPrompt.loop",
     )(function* (input: LoopInput) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      const result = yield* state.ensureRunning(
+        input.sessionID,
+        lastAssistant(input.sessionID),
+        runLoop(input.sessionID),
+      )
+      const messages = yield* MessageV2.filterCompactedEffect(input.sessionID).pipe(
+        Effect.provideService(Database.Service, database),
+      )
+      const { user } = MessageV2.latest(messages)
+      if (result.info.role === "assistant" && user && result.info.parentID !== user.id) {
+        return yield* state.ensureRunning(
+          input.sessionID,
+          lastAssistant(input.sessionID),
+          runLoop(input.sessionID),
+        )
+      }
+      return result
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError | NotFoundError> = Effect.fn(

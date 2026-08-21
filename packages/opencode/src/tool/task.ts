@@ -228,29 +228,32 @@ export const TaskTool = Tool.define(
           agent: next.name,
           parts,
         })
+        const text = result.parts
+          .filter(
+            (item): item is SessionV1.TextPart => item.type === "text" && item.text.trim() !== "",
+          )
+          .map((item) => item.text)
+          .join("")
+        const parentAgent = yield* agent.get(ctx.agent)
         if (result.info.role === "assistant" && result.info.error) {
           const message =
             "message" in result.info.error.data && typeof result.info.error.data.message === "string"
               ? result.info.error.data.message
               : result.info.error.name
-          return yield* Effect.fail(new Error(`Subagent failed (task_id: ${nextSession.id}): ${message}`))
+          childState = "error"
+          const partial = text.trim() === "" ? "" : `\n\nPartial output:\n${text}`
+          const diagnostic = `Subagent failed (task_id: ${nextSession.id}): ${message}${partial}`
+          const truncated = yield* truncate.output(diagnostic, { maxBytes: MAX_TASK_RESULT_BYTES }, parentAgent)
+          return yield* Effect.fail(new Error(truncated.content))
         }
-        const failed = result.parts.findLast((item) => item.type === "tool" && item.state.status === "error")
-        if (failed?.type === "tool" && failed.state.status === "error") {
-          return yield* Effect.fail(new Error(`Subagent failed (task_id: ${nextSession.id}): ${failed.state.error}`))
-        }
-        const text = result.parts.findLast((item) => item.type === "text")?.text ?? ""
         if (text.trim() === "") {
           const finish = result.info.role === "assistant" ? result.info.finish : undefined
           const outputTokens = result.info.role === "assistant" ? result.info.tokens.output : 0
           const diagnostic = emptyResultMessage(finish, outputTokens)
-          const failed =
-            finish === "length" || finish === "unknown" || finish === "error" || outputTokens === 0
-          childState = failed ? "error" : "completed"
-          return failed ? `${diagnostic}. ${EMPTY_RESULT_HINT}` : diagnostic
+          childState = "error"
+          return yield* Effect.fail(new Error(`${diagnostic}. ${EMPTY_RESULT_HINT}`))
         }
         childState = "completed"
-        const parentAgent = yield* agent.get(ctx.agent)
         const truncated = yield* truncate.output(text, { maxBytes: MAX_TASK_RESULT_BYTES }, parentAgent)
         return truncated.content
       })
@@ -281,7 +284,7 @@ export const TaskTool = Tool.define(
               },
             ],
           })
-          .pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
+          .pipe(Effect.ignore)
       })
 
       const notify = Effect.fn("TaskTool.notifyBackgroundResult")(function* (jobID: string) {

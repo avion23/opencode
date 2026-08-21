@@ -3,7 +3,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
 import { Agent } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -109,9 +109,10 @@ const seed = Effect.fn("TaskToolTest.seed")(function* (title = "Pinned", model =
 function stubOps(opts?: {
   onPrompt?: (input: SessionPrompt.PromptInput) => void
   text?: string
-  error?: NonNullable<SessionV1.Assistant["error"]>
-  toolError?: string
   finish?: string
+  outputTokens?: number
+  error?: NonNullable<SessionV1.Assistant["error"]>
+  texts?: readonly string[]
 }): TaskPromptOps {
   return {
     cancel: () => Effect.void,
@@ -119,7 +120,7 @@ function stubOps(opts?: {
     prompt: (input) =>
       Effect.sync(() => {
         opts?.onPrompt?.(input)
-        return reply(input, opts?.text ?? "done", opts?.error, opts?.toolError, opts?.finish)
+        return reply(input, opts?.text ?? "done", opts?.finish, opts?.outputTokens, opts?.error, opts?.texts)
       }),
   }
 }
@@ -127,9 +128,10 @@ function stubOps(opts?: {
 function reply(
   input: SessionPrompt.PromptInput,
   text: string,
-  error?: NonNullable<SessionV1.Assistant["error"]>,
-  toolError?: string,
   finish = "stop",
+  outputTokens = 0,
+  error?: NonNullable<SessionV1.Assistant["error"]>,
+  texts: readonly string[] = [text],
 ): SessionV1.WithParts {
   const id = MessageID.ascending()
   return {
@@ -142,40 +144,20 @@ function reply(
       agent: input.agent ?? "general",
       cost: 0,
       path: { cwd: "/tmp", root: "/tmp" },
-      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      tokens: { input: 0, output: outputTokens, reasoning: 0, cache: { read: 0, write: 0 } },
       modelID: input.model?.modelID ?? ref.modelID,
       providerID: input.model?.providerID ?? ref.providerID,
       time: { created: Date.now() },
       finish,
       error,
     },
-    parts: [
-      {
-        id: PartID.ascending(),
-        messageID: id,
-        sessionID: input.sessionID,
-        type: "text",
-        text,
-      },
-      ...(toolError
-        ? [
-            {
-              id: PartID.ascending(),
-              messageID: id,
-              sessionID: input.sessionID,
-              type: "tool" as const,
-              tool: "read",
-              callID: "call-1",
-              state: {
-                status: "error" as const,
-                input: { filePath: "/external" },
-                error: toolError,
-                time: { start: Date.now(), end: Date.now() },
-              },
-            },
-          ]
-        : []),
-    ],
+    parts: texts.map((text) => ({
+      id: PartID.ascending(),
+      messageID: id,
+      sessionID: input.sessionID,
+      type: "text" as const,
+      text,
+    })),
   }
 }
 
@@ -293,93 +275,6 @@ describe("tool.task", () => {
       expect(result.output).toContain(`<task id="${child.id}" state="completed">`)
       expect(seen?.sessionID).toBe(child.id)
       expect(seen?.variant).toBe("xhigh")
-    }),
-  )
-
-  it.instance("execute surfaces child errors with a resumable task_id", () =>
-    Effect.gen(function* () {
-      const sessions = yield* Session.Service
-      const { chat, assistant } = yield* seed()
-      const tool = yield* TaskTool
-      const def = yield* tool.init()
-
-      const exit = yield* def
-        .execute(
-          {
-            description: "inspect bug",
-            prompt: "look into the cache key path",
-            subagent_type: "general",
-          },
-          {
-            sessionID: chat.id,
-            messageID: assistant.id,
-            agent: "build",
-            abort: new AbortController().signal,
-            extra: {
-              promptOps: stubOps({
-                text: "",
-                error: new SessionV1.APIError({ message: "Network connection lost", isRetryable: false }).toObject(),
-              }),
-            },
-            messages: [],
-            metadata: () => Effect.void,
-            ask: () => Effect.void,
-          },
-        )
-        .pipe(Effect.exit)
-
-      expect(Exit.isFailure(exit)).toBe(true)
-      if (Exit.isSuccess(exit)) throw new Error("expected task failure")
-      const child = (yield* sessions.children(chat.id))[0]
-      expect(child).toBeDefined()
-      const failure = Cause.squash(exit.cause)
-      expect(failure).toBeInstanceOf(Error)
-      if (!(failure instanceof Error)) throw new Error("expected Error defect")
-      expect(failure.message).toBe(`Subagent failed (task_id: ${child?.id}): Network connection lost`)
-    }),
-  )
-
-  it.instance("execute surfaces terminal child tool errors with a resumable task_id", () =>
-    Effect.gen(function* () {
-      const sessions = yield* Session.Service
-      const { chat, assistant } = yield* seed()
-      const tool = yield* TaskTool
-      const def = yield* tool.init()
-
-      const exit = yield* def
-        .execute(
-          {
-            description: "inspect external directory",
-            prompt: "read the external directory",
-            subagent_type: "general",
-          },
-          {
-            sessionID: chat.id,
-            messageID: assistant.id,
-            agent: "build",
-            abort: new AbortController().signal,
-            extra: {
-              promptOps: stubOps({
-                text: "I will inspect the directory.",
-                toolError: "The user rejected permission to use this specific tool call.",
-              }),
-            },
-            messages: [],
-            metadata: () => Effect.void,
-            ask: () => Effect.void,
-          },
-        )
-        .pipe(Effect.exit)
-
-      expect(Exit.isFailure(exit)).toBe(true)
-      if (Exit.isSuccess(exit)) throw new Error("expected task failure")
-      const child = (yield* sessions.children(chat.id))[0]
-      const failure = Cause.squash(exit.cause)
-      expect(failure).toBeInstanceOf(Error)
-      if (!(failure instanceof Error)) throw new Error("expected Error defect")
-      expect(failure.message).toBe(
-        `Subagent failed (task_id: ${child?.id}): The user rejected permission to use this specific tool call.`,
-      )
     }),
   )
 
@@ -664,12 +559,446 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("renders an error when the child is truncated with no final text", () =>
+  it.instance("fails when the child is truncated with no final text", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
       const promptOps = stubOps({ text: "", finish: "length" })
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) return
+      const failure = Cause.squash(exit.cause)
+      expect(failure).toBeInstanceOf(Error)
+      if (failure instanceof Error) {
+        expect(failure.message).toContain("subagent returned no final text")
+        expect(failure.message).toContain("finish=length")
+        expect(failure.message).toContain("output_tokens=0")
+        expect(failure.message).toContain("re-dispatching")
+      }
+    }),
+  )
+
+  it.instance("fails when length truncates a child with output tokens", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ text: "", finish: "length", outputTokens: 12 }) },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) return
+      const failure = Cause.squash(exit.cause)
+      expect(failure).toBeInstanceOf(Error)
+      if (failure instanceof Error) {
+        expect(failure.message).toContain("subagent returned no final text")
+        expect(failure.message).toContain("finish=length")
+        expect(failure.message).toContain("output_tokens=12")
+      }
+    }),
+  )
+
+  it.instance("fails when stop returns output tokens without final text", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ text: "", finish: "stop", outputTokens: 12 }) },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) return
+      const failure = Cause.squash(exit.cause)
+      expect(failure).toBeInstanceOf(Error)
+      if (failure instanceof Error) {
+        expect(failure.message).toContain("subagent returned no final text")
+        expect(failure.message).toContain("finish=stop")
+        expect(failure.message).toContain("output_tokens=12")
+      }
+    }),
+  )
+
+  it.instance("fails when the child has no final text with an unknown finish", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ text: "", finish: "unknown", outputTokens: 12 }) },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) return
+      const failure = Cause.squash(exit.cause)
+      expect(failure).toBeInstanceOf(Error)
+      if (failure instanceof Error) {
+        expect(failure.message).toContain("finish=unknown")
+        expect(failure.message).toContain("output_tokens=12")
+      }
+    }),
+  )
+
+  it.instance("fails when the child has no final text with an error finish", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ text: "", finish: "error", outputTokens: 12 }) },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) return
+      const failure = Cause.squash(exit.cause)
+      expect(failure).toBeInstanceOf(Error)
+      if (failure instanceof Error) {
+        expect(failure.message).toContain("finish=error")
+        expect(failure.message).toContain("output_tokens=12")
+      }
+    }),
+  )
+
+  it.instance("fails when the child returns partial text with an error", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const error = new SessionV1.ContentFilterError({ message: "The response was blocked by the provider" }).toObject()
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ text: "partial output", error }) },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) return
+      const failure = Cause.squash(exit.cause)
+      expect(failure).toBeInstanceOf(Error)
+      if (failure instanceof Error) {
+        expect(failure.message).toContain("partial output")
+        expect(failure.message).toContain("The response was blocked by the provider")
+      }
+    }),
+  )
+
+  it.instance("preserves multiple visible text parts in partial child errors", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const error = new SessionV1.ContentFilterError({ message: "The response was blocked by the provider" }).toObject()
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ texts: ["partial first", "partial later"], error }) },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) return
+      const failure = Cause.squash(exit.cause)
+      expect(failure).toBeInstanceOf(Error)
+      if (failure instanceof Error) {
+        expect(failure.message).toContain("partial first")
+        expect(failure.message).toContain("partial later")
+        expect(failure.message).toContain("The response was blocked by the provider")
+      }
+    }),
+  )
+
+  it.instance("bounds partial output in child errors", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const error = new SessionV1.ContentFilterError({
+        message: `provider error start\n${"e".repeat(100_000)}\nprovider error tail`,
+      }).toObject()
+      const text = `partial start\n${"x".repeat(100_000)}\npartial tail`
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ text, error }) },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) return
+      const failure = Cause.squash(exit.cause)
+      expect(failure).toBeInstanceOf(Error)
+      if (failure instanceof Error) {
+        expect(failure.message).toContain("Subagent failed (task_id:")
+        expect(failure.message).toContain("provider error start")
+        expect(failure.message).toContain("truncated")
+        expect(failure.message).not.toContain("provider error tail")
+        expect(failure.message).not.toContain("partial tail")
+        expect(failure.message.length).toBeLessThan(32 * 1024)
+      }
+    }),
+  )
+
+  it.instance("bounds combined text and error output", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const error = new SessionV1.ContentFilterError({
+        message: `provider error start\n${"e".repeat(1_000)}\nprovider error tail`,
+      }).toObject()
+      const first = `partial first\n${"x".repeat(8_000)}\npartial first tail`
+      const later = `partial later\n${"y".repeat(8_000)}\npartial later tail`
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ texts: [first, later], error }) },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) return
+      const failure = Cause.squash(exit.cause)
+      expect(failure).toBeInstanceOf(Error)
+      if (failure instanceof Error) {
+        expect(failure.message).toContain("provider error start")
+        expect(failure.message).toContain("partial first")
+        expect(failure.message).toContain("partial later")
+        expect(failure.message).toContain("truncated")
+        expect(failure.message).toContain("provider error tail")
+        expect(failure.message).not.toContain("partial later tail")
+        expect(failure.message.length).toBeLessThan(32 * 1024)
+      }
+    }),
+  )
+
+  it.instance("fails when the child has no output tokens with a benign finish", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ text: "", finish: "stop" }) },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) return
+      const failure = Cause.squash(exit.cause)
+      expect(failure).toBeInstanceOf(Error)
+      if (failure instanceof Error) {
+        expect(failure.message).toContain("finish=stop")
+        expect(failure.message).toContain("output_tokens=0")
+      }
+    }),
+  )
+
+  it.instance("fails when all child text parts are empty", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ texts: ["", " ", "\n"], finish: "stop", outputTokens: 12 }) },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) return
+      const failure = Cause.squash(exit.cause)
+      expect(failure).toBeInstanceOf(Error)
+      if (failure instanceof Error) {
+        expect(failure.message).toContain("subagent returned no final text")
+        expect(failure.message).toContain("finish=stop")
+        expect(failure.message).toContain("output_tokens=12")
+      }
+    }),
+  )
+
+  it.instance("still completes when the child stops with text", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const promptOps = stubOps({ text: "delivered", finish: "stop", outputTokens: 12 })
 
       const result = yield* def.execute(
         {
@@ -689,22 +1018,17 @@ describe("tool.task", () => {
         },
       )
 
-      expect(result.output).toContain(`<task id="${result.metadata.sessionId}" state="error">`)
-      expect(result.output).toContain("subagent returned no final text")
-      expect(result.output).toContain("finish=length")
-      expect(result.output).toContain("output_tokens=0")
-      expect(result.output).toContain("re-dispatching")
-      expect(result.output).not.toContain('state="completed"')
-      expect(result.output.trim()).not.toBe("")
+      expect(result.output).toContain(`<task id="${result.metadata.sessionId}" state="completed">`)
+      expect(result.output).toContain("delivered")
+      expect(result.output).not.toContain("subagent returned no final text")
     }),
   )
 
-  it.instance("still completes when the child stops with text", () =>
+  it.instance("completes when visible text is followed by an empty text part", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
-      const promptOps = stubOps({ text: "delivered", finish: "stop" })
 
       const result = yield* def.execute(
         {
@@ -717,7 +1041,7 @@ describe("tool.task", () => {
           messageID: assistant.id,
           agent: "build",
           abort: new AbortController().signal,
-          extra: { promptOps },
+          extra: { promptOps: stubOps({ texts: ["delivered", ""], finish: "stop" }) },
           messages: [],
           metadata: () => Effect.void,
           ask: () => Effect.void,
@@ -1151,6 +1475,156 @@ describe("tool.task", () => {
     }),
   )
 
+  background.instance("notifies the parent when a background child has no final text", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+      const promptOps: TaskPromptOps = {
+        cancel: () => Effect.void,
+        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+        prompt: (input) => {
+          if (input.sessionID === chat.id)
+            return Deferred.succeed(injected, input).pipe(Effect.as(reply(input, "injected")))
+          return Effect.succeed(reply(input, "", "length"))
+        },
+      }
+
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+          background: true,
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
+      expect(waited.info?.status).toBe("error")
+      expect(waited.info?.error).toContain("subagent returned no final text")
+      const notification = yield* Deferred.await(injected)
+      expect(notification.parts[0]?.type).toBe("text")
+      if (notification.parts[0]?.type === "text") {
+        expect(notification.parts[0].text).toContain(`state="error"`)
+        expect(notification.parts[0].text).toContain("subagent returned no final text")
+        expect(notification.parts[0].text).toContain("finish=length")
+        expect(notification.parts[0].text).toContain("re-dispatching")
+      }
+    }),
+  )
+
+  background.instance("notifies the parent when a background child returns partial text with an error", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+      const error = new SessionV1.ContentFilterError({
+        message: `provider error start\n${"e".repeat(100_000)}\nprovider error tail`,
+      }).toObject()
+      const text = `partial start\n${"x".repeat(100_000)}\npartial tail`
+      const promptOps: TaskPromptOps = {
+        cancel: () => Effect.void,
+        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+        prompt: (input) => {
+          if (input.sessionID === chat.id)
+            return Deferred.succeed(injected, input).pipe(Effect.as(reply(input, "injected")))
+          return Effect.succeed(reply(input, text, "stop", 0, error))
+        },
+      }
+
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+          background: true,
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
+      expect(waited.info?.status).toBe("error")
+      expect(waited.info?.error).toContain("Subagent failed (task_id:")
+      expect(waited.info?.error).toContain("provider error start")
+      expect(waited.info?.error).toContain("truncated")
+      expect(waited.info?.error).not.toContain("provider error tail")
+      expect(waited.info?.error).not.toContain("partial tail")
+      expect(waited.info?.error?.length).toBeLessThan(32 * 1024)
+      const notification = yield* Deferred.await(injected)
+      expect(notification.parts[0]?.type).toBe("text")
+      if (notification.parts[0]?.type === "text") {
+        expect(notification.parts[0].text).toContain(`state="error"`)
+        expect(notification.parts[0].text).toContain("Subagent failed (task_id:")
+        expect(notification.parts[0].text).toContain("provider error start")
+        expect(notification.parts[0].text).toContain("truncated")
+        expect(notification.parts[0].text).not.toContain("provider error tail")
+        expect(notification.parts[0].text).not.toContain("partial tail")
+        expect(notification.parts[0].text.length).toBeLessThan(32 * 1024)
+      }
+    }),
+  )
+
+  it.instance("preserves child provider errors as tool errors", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        prompt: () => Effect.die(new Error("provider request failed")),
+      }
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) return
+      const failure = Cause.squash(exit.cause)
+      expect(failure).toBeInstanceOf(Error)
+      if (failure instanceof Error) expect(failure.message).toBe("provider request failed")
+    }),
+  )
+
   it.instance("uses a fallback when a foreground task error string is blank", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seed()
@@ -1168,7 +1642,11 @@ describe("tool.task", () => {
             metadata: input.metadata,
           }),
         extend: () => Effect.succeed(false),
-        wait: () => Effect.succeed({ timedOut: false, info: { id: "task", type: "task", status: "error", started_at: 0, error } }),
+        wait: () =>
+          Effect.succeed({
+            timedOut: false,
+            info: { id: "task", type: "task", status: "error", started_at: 0, error },
+          }),
         waitForPromotion: () => Effect.never,
         promote: () => Effect.succeed(undefined),
         cancel: () => Effect.succeed(undefined),
@@ -1231,7 +1709,11 @@ describe("tool.task", () => {
             metadata: input.metadata,
           }),
         extend: () => Effect.succeed(false),
-        wait: () => Effect.succeed({ timedOut: false, info: { id: "task", type: "task", status: "error", started_at: 0, error } }),
+        wait: () =>
+          Effect.succeed({
+            timedOut: false,
+            info: { id: "task", type: "task", status: "error", started_at: 0, error },
+          }),
         waitForPromotion: () => Effect.never,
         promote: () => Effect.succeed(undefined),
         cancel: () => Effect.succeed(undefined),
@@ -1242,7 +1724,8 @@ describe("tool.task", () => {
         cancel: () => Effect.void,
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) => {
-          if (input.sessionID === chat.id) return Deferred.succeed(injected, input).pipe(Effect.as(reply(input, "injected")))
+          if (input.sessionID === chat.id)
+            return Deferred.succeed(injected, input).pipe(Effect.as(reply(input, "injected")))
           return Effect.succeed(reply(input, "done"))
         },
       }
@@ -1273,7 +1756,11 @@ describe("tool.task", () => {
 
       error = "real task error"
       const injectedReal = yield* Deferred.make<SessionPrompt.PromptInput>()
-      const realPromptOps = { ...promptOps, prompt: (input: SessionPrompt.PromptInput) => Deferred.succeed(injectedReal, input).pipe(Effect.as(reply(input, "injected"))) }
+      const realPromptOps = {
+        ...promptOps,
+        prompt: (input: SessionPrompt.PromptInput) =>
+          Deferred.succeed(injectedReal, input).pipe(Effect.as(reply(input, "injected"))),
+      }
       yield* def.execute(
         {
           description: "inspect bug",

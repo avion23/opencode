@@ -6,7 +6,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Scope } from "effect"
 import path from "path"
 import { fileURLToPath } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
@@ -989,6 +989,86 @@ it.instance("failed subtask preserves metadata on error tool state", () =>
   }),
 )
 
+it.instance("continues after a foreground task failure", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* llm.tool("task", {
+      description: "inspect bug",
+      prompt: "look into the cache key path",
+      subagent_type: "general",
+    })
+    yield* llm.push(reply().stop().item())
+    yield* llm.text("continued")
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+    expect(result.info.role).toBe("assistant")
+    expect(result.parts.some((part) => part.type === "text" && part.text === "continued")).toBe(true)
+
+    const messages = yield* MessageV2.filterCompactedEffect(chat.id)
+    const task = messages
+      .flatMap((message) => message.parts)
+      .find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "task")
+    expect(task?.state.status).toBe("error")
+    if (task?.state.status === "error") {
+      expect(task.state.error).toContain("subagent returned no final text")
+      expect(task.state.error).toContain("finish=stop")
+    }
+  }),
+)
+
+it.instance("continues after a foreground task provider error with partial output", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* llm.tool("task", {
+      description: "inspect bug",
+      prompt: "look into the cache key path",
+      subagent_type: "general",
+    })
+    yield* llm.push(reply().text("partial response").contentFilter().item())
+    yield* llm.text("continued")
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+    expect(result.info.role).toBe("assistant")
+    expect(result.parts.some((part) => part.type === "text" && part.text === "continued")).toBe(true)
+
+    const messages = yield* MessageV2.filterCompactedEffect(chat.id)
+    const task = messages
+      .flatMap((message) => message.parts)
+      .find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "task")
+    expect(task?.state.status).toBe("error")
+    if (task?.state.status === "error") {
+      expect(task.state.error).toContain("partial response")
+      expect(task.state.error).toContain("The response was blocked by the provider's content filter")
+    }
+  }),
+)
+
 it.instance("subtask child inherits parent session external_directory allow", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
@@ -1493,6 +1573,69 @@ it.instance("prompt submitted during an active run is included in the next LLM i
     const messages = inputs.at(-1)?.messages
     if (!Array.isArray(messages)) throw new Error("expected LLM messages")
     expect(messages.at(-1)).toEqual({ role: "user", content: "second" })
+  }),
+)
+
+it.instance("reloads a notification admitted while the parent is finishing", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const events = yield* EventV2Bridge.Service
+    const scope = yield* Scope.Scope
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const handled = yield* Deferred.make<void>()
+    const off = yield* events.listen((event) => {
+      if (event.type !== Session.Event.Error.type) return Effect.void
+      const data = event.data as typeof Session.Event.Error.data.Type
+      if (data.sessionID !== chat.id) return Effect.void
+      return Effect.gen(function* () {
+        yield* prompt
+          .prompt({
+            sessionID: chat.id,
+            agent: "build",
+            model: ref,
+            noReply: true,
+            parts: [{ type: "text", synthetic: true, text: "Background task completed" }],
+          })
+          .pipe(Effect.ignore)
+        yield* prompt.loop({ sessionID: chat.id }).pipe(
+          Effect.tap(() => Deferred.succeed(handled, void 0).pipe(Effect.asVoid)),
+          Effect.ignore,
+          Effect.forkIn(scope, { startImmediately: true }),
+          Effect.asVoid,
+        )
+      })
+    })
+    yield* Effect.addFinalizer(() => off)
+
+    yield* llm.push(reply().text("parent partial").contentFilter())
+    yield* llm.text("notification handled")
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      noReply: true,
+      parts: [{ type: "text", text: "parent prompt" }],
+    })
+
+    const parent = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    const parentExit = yield* Fiber.await(parent)
+    expect(Exit.isSuccess(parentExit)).toBe(true)
+    yield* awaitWithTimeout(llm.wait(2), "timed out waiting for the notification drain")
+    yield* awaitWithTimeout(Deferred.await(handled), "timed out waiting for the notification prompt")
+
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    const notification = messages.find(
+      (message) =>
+        message.info.role === "user" &&
+        message.parts.some((part) => part.type === "text" && part.text === "Background task completed"),
+    )
+    expect(notification).toBeDefined()
+    const followup = messages.find(
+      (message) => message.info.role === "assistant" && message.info.parentID === notification?.info.id,
+    )
+    expect(followup?.parts).toEqual(expect.arrayContaining([expect.objectContaining({ text: "notification handled" })]))
   }),
 )
 
