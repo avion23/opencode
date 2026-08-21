@@ -3,6 +3,8 @@ import {
   LLMClient,
   LLMError,
   LLMEvent,
+  AuthenticationReason,
+  ProviderInternalReason,
   Model,
   TransportReason,
   InvalidRequestReason,
@@ -56,6 +58,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { Location } from "@opencode-ai/core/location"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
+import * as TestClock from "effect/testing/TestClock"
 import { asc, eq } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
 
@@ -63,6 +66,7 @@ const requests: LLMRequest[] = []
 let response: LLMEvent[] = []
 let responses: LLMEvent[][] | undefined
 let responseStream: Stream.Stream<LLMEvent, LLMError> | undefined
+let responseStreams: Array<Stream.Stream<LLMEvent, LLMError>> | undefined
 let streamGate: Deferred.Deferred<void> | undefined
 let streamStarted: Deferred.Deferred<void> | undefined
 let streamFailure: LLMError | undefined
@@ -82,6 +86,7 @@ const client = Layer.succeed(
         responseStream = undefined
         return stream
       }
+      if (responseStreams !== undefined) return responseStreams.shift() ?? Stream.empty
       const events = streamFailure
         ? Stream.fail(streamFailure)
         : Stream.fromIterable(responses === undefined ? response : (responses.shift() ?? []))
@@ -323,6 +328,7 @@ const setup = Effect.gen(function* () {
   responses = undefined
   streamFailure = undefined
   responseStream = undefined
+  responseStreams = undefined
   streamGate = undefined
   streamStarted = undefined
   toolExecutionGate = undefined
@@ -344,6 +350,13 @@ const providerUnavailable = () =>
     module: "test",
     method: "stream",
     reason: new TransportReason({ message: "Provider unavailable" }),
+  })
+
+const providerCapacity = (retryAfterMs = 0) =>
+  new LLMError({
+    module: "test",
+    method: "stream",
+    reason: new ProviderInternalReason({ message: "Service unavailable", status: 503, retryAfterMs }),
   })
 
 const setupOverflowRecovery = Effect.gen(function* () {
@@ -608,6 +621,11 @@ describe("SessionRunnerLLM", () => {
             },
           ],
         },
+        {
+          type: "assistant",
+          finish: "error",
+          error: { type: "unknown", message: "Provider stream ended without a terminal finish event" },
+        },
       ])
     }),
   )
@@ -626,6 +644,11 @@ describe("SessionRunnerLLM", () => {
 
       expect(requests).toHaveLength(1)
       expect(yield* session.messages({ sessionID })).toMatchObject([
+        {
+          type: "assistant",
+          finish: "error",
+          error: { type: "unknown", message: "Provider stream ended without a terminal finish event" },
+        },
         { id: message.id, type: "user", text: "Run automatically" },
       ])
     }),
@@ -652,7 +675,7 @@ describe("SessionRunnerLLM", () => {
         { role: "user", content: [{ type: "text", text: "First" }] },
         { role: "user", content: [{ type: "text", text: "Second" }] },
       ])
-      expect(yield* session.messages({ sessionID })).toHaveLength(2)
+      expect(yield* session.messages({ sessionID })).toHaveLength(3)
     }),
   )
 
@@ -765,7 +788,7 @@ describe("SessionRunnerLLM", () => {
       ])
       expect(requests[1]?.messages.map((message) => message.role)).toEqual(["user", "user", "system"])
       expect(requests[1]?.messages.at(-1)?.content).toEqual([{ type: "text", text: "Changed context" }])
-      expect(yield* session.messages({ sessionID })).toHaveLength(3)
+      expect(yield* session.messages({ sessionID })).toHaveLength(5)
       const { db } = yield* Database.Service
       expect(
         yield* db
@@ -776,7 +799,7 @@ describe("SessionRunnerLLM", () => {
           .pipe(Effect.orDie),
       ).toHaveLength(1)
       yield* replaySessionProjection(sessionID)
-      expect(yield* session.messages({ sessionID })).toHaveLength(3)
+      expect(yield* session.messages({ sessionID })).toHaveLength(5)
     }),
   )
 
@@ -963,7 +986,7 @@ describe("SessionRunnerLLM", () => {
       expect(requests[1]?.messages.at(-1)?.content).toEqual([
         { type: "text", text: "System context source removed: test/context" },
       ])
-      expect(yield* session.messages({ sessionID })).toHaveLength(3)
+      expect(yield* session.messages({ sessionID })).toHaveLength(5)
     }),
   )
 
@@ -999,14 +1022,17 @@ describe("SessionRunnerLLM", () => {
       expect(requests[2]?.messages.filter((message) => message.role === "system")).toHaveLength(2)
       expect((yield* session.context(sessionID)).map((message) => message.type)).toEqual([
         "user",
+        "assistant",
         "user",
         "system",
+        "assistant",
         "model-switched",
         "user",
         "system",
+        "assistant",
       ])
       yield* replaySessionProjection(sessionID)
-      expect(yield* session.messages({ sessionID })).toHaveLength(6)
+      expect(yield* session.messages({ sessionID })).toHaveLength(9)
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Fourth" }), resume: false })
       yield* session.resume(sessionID)
     }),
@@ -1807,6 +1833,11 @@ describe("SessionRunnerLLM", () => {
             },
           ],
         },
+        {
+          type: "assistant",
+          finish: "error",
+          error: { type: "unknown", message: "Provider stream ended without a terminal finish event" },
+        },
       ])
 
       yield* replaySessionProjection(sessionID)
@@ -1836,6 +1867,11 @@ describe("SessionRunnerLLM", () => {
               },
             },
           ],
+        },
+        {
+          type: "assistant",
+          finish: "error",
+          error: { type: "unknown", message: "Provider stream ended without a terminal finish event" },
         },
       ])
     }),
@@ -2323,6 +2359,11 @@ describe("SessionRunnerLLM", () => {
             },
           ],
         },
+        {
+          type: "assistant",
+          finish: "error",
+          error: { type: "unknown", message: "Provider stream ended without a terminal finish event" },
+        },
       ])
     }),
   )
@@ -2422,6 +2463,11 @@ describe("SessionRunnerLLM", () => {
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "user", text: "Recover interrupted tool input" },
         { type: "assistant", content: [{ type: "tool", id: "call-pending-interrupted", state: { status: "error" } }] },
+        {
+          type: "assistant",
+          finish: "error",
+          error: { type: "unknown", message: "Provider stream ended without a terminal finish event" },
+        },
       ])
     }),
   )
@@ -2932,7 +2978,8 @@ describe("SessionRunnerLLM", () => {
       yield* setup
       const session = yield* SessionV2.Service
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Settle before failing" }), resume: false })
-      const failure = providerUnavailable()
+      const failure = providerCapacity()
+      requests.length = 0
       toolExecutionGate = yield* Deferred.make<void>()
       responseStream = Stream.concat(
         Stream.fromIterable([
@@ -2949,6 +2996,7 @@ describe("SessionRunnerLLM", () => {
       expect(yield* Fiber.join(run).pipe(Effect.flip)).toBe(failure)
       toolExecutionGate = undefined
 
+      expect(requests).toHaveLength(1)
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "user", text: "Settle before failing" },
         {
@@ -3168,6 +3216,314 @@ describe("SessionRunnerLLM", () => {
       expect(requests[1]?.tools).not.toEqual([])
       expect(requests[2]?.toolChoice).toMatchObject({ type: "none" })
       expect(executions).toEqual(["before", "after"])
+    }),
+  )
+
+  it.effect("keeps a normally settled provider stream successful", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Settle normally" }), resume: false })
+      response = [
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "text-settled" }),
+        LLMEvent.textDelta({ id: "text-settled", text: "Done" }),
+        LLMEvent.textEnd({ id: "text-settled" }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      ]
+
+      yield* session.resume(sessionID)
+
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "user", text: "Settle normally" },
+        {
+          type: "assistant",
+          finish: "stop",
+          content: [{ type: "text", id: "text-settled", text: "Done" }],
+          time: { completed: expect.anything() },
+        },
+      ])
+    }),
+  )
+
+  it.effect("retries a retryable 503 stream failure before publishing the provider turn", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Retry capacity" }), resume: false })
+      const fixture = fragmentFixture("text", "text-retry", ["Recovered"])
+      const failure = providerCapacity()
+      requests.length = 0
+      responseStreams = [Stream.fail(failure), Stream.fromIterable(fixture.completeEvents)]
+
+      yield* session.resume(sessionID)
+
+      expect(requests).toHaveLength(2)
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "user", text: "Retry capacity" },
+        { type: "assistant", finish: "stop", content: [{ type: "text", text: "Recovered" }] },
+      ])
+    }),
+  )
+
+  it.effect("retries a retryable provider EOF before publishing the provider turn", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Retry EOF" }), resume: false })
+      const fixture = fragmentFixture("text", "text-eof-retry", ["Recovered"])
+      requests.length = 0
+      responseStreams = [
+        Stream.fromIterable([
+          LLMEvent.providerError({ message: "Provider stream ended without a terminal finish event", retryable: true }),
+        ]),
+        Stream.fromIterable(fixture.completeEvents),
+      ]
+
+      const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      while (requests.length < 1) yield* Effect.yieldNow
+      yield* TestClock.adjust(1_000)
+      yield* Fiber.join(run)
+
+      expect(requests).toHaveLength(2)
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "user", text: "Retry EOF" },
+        { type: "assistant", finish: "stop", content: [{ type: "text", text: "Recovered" }] },
+      ])
+    }),
+  )
+
+  it.effect("does not retry after durable assistant output", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Keep assistant output" }), resume: false })
+      const failure = providerCapacity()
+      requests.length = 0
+      responseStream = Stream.concat(
+        Stream.fromIterable([
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.textStart({ id: "text-durable" }),
+          LLMEvent.textDelta({ id: "text-durable", text: "Partial" }),
+          LLMEvent.textEnd({ id: "text-durable" }),
+        ]),
+        Stream.fail(failure),
+      )
+
+      expect(yield* session.resume(sessionID).pipe(Effect.flip)).toBe(failure)
+      expect(requests).toHaveLength(1)
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "user", text: "Keep assistant output" },
+        {
+          type: "assistant",
+          finish: "error",
+          error: { type: "unknown", message: "Service unavailable" },
+          content: [{ type: "text", id: "text-durable", text: "Partial" }],
+        },
+      ])
+    }),
+  )
+
+  it.effect("does not retry a permanent provider stream failure", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Do not retry invalid request" }), resume: false })
+      const failure = new LLMError({
+        module: "test",
+        method: "stream",
+        reason: new InvalidRequestReason({ message: "Invalid request" }),
+      })
+      requests.length = 0
+      responseStreams = [Stream.fail(failure)]
+
+      expect(yield* session.resume(sessionID).pipe(Effect.flip)).toBe(failure)
+      expect(requests).toHaveLength(1)
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "user", text: "Do not retry invalid request" },
+        { type: "assistant", finish: "error", error: { type: "unknown", message: "Invalid request" } },
+      ])
+    }),
+  )
+
+  it.effect("does not retry an authentication provider stream failure", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Do not retry auth" }), resume: false })
+      const failure = new LLMError({
+        module: "test",
+        method: "stream",
+        reason: new AuthenticationReason({ message: "Invalid credentials", kind: "invalid" }),
+      })
+      requests.length = 0
+      responseStreams = [Stream.fail(failure)]
+
+      expect(yield* session.resume(sessionID).pipe(Effect.flip)).toBe(failure)
+      expect(requests).toHaveLength(1)
+    }),
+  )
+
+  it.effect("bounds retryable stream failures and persists one final failure", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Exhaust capacity retries" }), resume: false })
+      const failures = [providerCapacity(), providerCapacity(), providerCapacity()]
+      requests.length = 0
+      responseStreams = failures.map((failure) => Stream.fail(failure))
+
+      expect(yield* session.resume(sessionID).pipe(Effect.flip)).toBe(failures[2])
+      expect(requests).toHaveLength(3)
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "user", text: "Exhaust capacity retries" },
+        { type: "assistant", finish: "error", error: { type: "unknown", message: "Service unavailable" } },
+      ])
+      const { db } = yield* Database.Service
+      const types = yield* db
+        .select({ type: EventTable.type })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, sessionID))
+        .all()
+        .pipe(Effect.orDie)
+      expect(
+        types.filter((event) => event.type === EventV2.versionedType(SessionEvent.Step.Failed.type, 2)),
+      ).toHaveLength(1)
+      expect(
+        types.filter((event) => event.type === EventV2.versionedType(SessionEvent.Step.Ended.type, 2)),
+      ).toHaveLength(0)
+    }),
+  )
+
+  it.effect("fails an assistant step when the provider stream omits step settlement", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Missing settlement" }), resume: false })
+      response = [
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "text-unsettled" }),
+        LLMEvent.textDelta({ id: "text-unsettled", text: "Partial" }),
+        LLMEvent.textEnd({ id: "text-unsettled" }),
+        LLMEvent.finish({ reason: "stop" }),
+      ]
+
+      yield* session.resume(sessionID)
+
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "user", text: "Missing settlement" },
+        {
+          type: "assistant",
+          finish: "error",
+          error: { type: "unknown", message: "Provider stream ended without a terminal finish event" },
+          content: [{ type: "text", id: "text-unsettled", text: "Partial" }],
+          time: { completed: expect.anything() },
+        },
+      ])
+      const { db } = yield* Database.Service
+      const types = yield* db
+        .select({ type: EventTable.type })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, sessionID))
+        .all()
+        .pipe(Effect.orDie)
+      expect(
+        types.filter((event) => event.type === EventV2.versionedType(SessionEvent.Step.Failed.type, 2)),
+      ).toHaveLength(1)
+      expect(
+        types.filter((event) => event.type === EventV2.versionedType(SessionEvent.Step.Ended.type, 2)),
+      ).toHaveLength(0)
+    }),
+  )
+
+  it.effect("keeps typed provider stream failures on the existing error path", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Typed failure" }), resume: false })
+      const failure = providerUnavailable()
+      responseStream = Stream.fail(failure)
+
+      expect(yield* session.resume(sessionID).pipe(Effect.flip)).toBe(failure)
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "user", text: "Typed failure" },
+        {
+          type: "assistant",
+          finish: "error",
+          error: { type: "unknown", message: "Provider unavailable" },
+          time: { completed: expect.anything() },
+        },
+      ])
+    }),
+  )
+
+  it.effect("interrupts a provider retry delay without starting another attempt", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Interrupt retry" }), resume: false })
+      requests.length = 0
+      responseStreams = [Stream.fail(providerCapacity(30_000))]
+
+      const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      while (requests.length < 1) yield* Effect.yieldNow
+      yield* Fiber.interrupt(run)
+
+      expect(requests).toHaveLength(1)
+      expect((yield* Fiber.await(run))._tag).toBe("Failure")
+    }),
+  )
+
+  it.effect("does not overwrite a typed provider failure after step settlement", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Typed failure after settlement" }), resume: false })
+      const failure = providerCapacity()
+      requests.length = 0
+      responseStream = Stream.concat(
+        Stream.fromIterable([
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        ]),
+        Stream.fail(failure),
+      )
+
+      expect(yield* session.resume(sessionID).pipe(Effect.flip)).toBe(failure)
+      expect(requests).toHaveLength(1)
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "user", text: "Typed failure after settlement" },
+        {
+          type: "assistant",
+          finish: "error",
+          error: { type: "unknown", message: "Service unavailable" },
+          time: { completed: expect.anything() },
+        },
+      ])
+      const { db } = yield* Database.Service
+      const types = yield* db
+        .select({ type: EventTable.type })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, sessionID))
+        .all()
+        .pipe(Effect.orDie)
+      expect(
+        types.filter((event) => event.type === EventV2.versionedType(SessionEvent.Step.Failed.type, 2)),
+      ).toHaveLength(1)
+      expect(
+        types.filter((event) => event.type === EventV2.versionedType(SessionEvent.Step.Ended.type, 2)),
+      ).toHaveLength(0)
+
+      yield* replaySessionProjection(sessionID)
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "user", text: "Typed failure after settlement" },
+        {
+          type: "assistant",
+          finish: "error",
+          error: { type: "unknown", message: "Service unavailable" },
+        },
+      ])
     }),
   )
 

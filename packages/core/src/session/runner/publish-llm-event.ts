@@ -424,6 +424,7 @@ export const createLLMEventPublisher = (service: EventV2.Interface, input: Input
     failUnsettledTools,
     hasActiveAssistant: () => assistantActive,
     hasAssistantStarted: () => assistantMessageID !== undefined,
+    hasAssistantFailure: () => assistantFailed,
     hasProviderError: () => providerFailed,
     stepSettlement: () => stepSettlement,
     startAssistant,

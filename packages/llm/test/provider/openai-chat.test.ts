@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { Effect, Schema, Stream } from "effect"
+import { Cause, Effect, Exit, Schema, Stream } from "effect"
 import { HttpClientRequest } from "effect/unstable/http"
 import { LLM, LLMError, LLMEvent, Message, Model, ToolCallPart, Usage } from "../../src"
 import * as Azure from "../../src/providers/azure"
@@ -10,7 +10,7 @@ import { Auth, LLMClient } from "../../src/route"
 import { it } from "../lib/effect"
 import { dynamicResponse, fixedResponse, truncatedStream } from "../lib/http"
 import { deltaChunk, usageChunk } from "../lib/openai-chunks"
-import { sseEvents } from "../lib/sse"
+import { sseEvents, sseRaw } from "../lib/sse"
 
 const TargetJson = Schema.fromJsonString(Schema.Unknown)
 const encodeJson = Schema.encodeSync(TargetJson)
@@ -588,7 +588,7 @@ describe("OpenAI Chat route", () => {
     }),
   )
 
-  it.effect("does not finalize streamed tool calls without a finish reason", () =>
+  it.effect("surfaces a provider error when the stream ends without a finish reason", () =>
     Effect.gen(function* () {
       const body = sseEvents(
         deltaChunk({
@@ -603,25 +603,78 @@ describe("OpenAI Chat route", () => {
       const events = Array.from(
         yield* LLMClient.stream(input).pipe(Stream.runCollect, Effect.provide(fixedResponse(body))),
       )
-      const error = yield* LLMClient.generate(input).pipe(Effect.provide(fixedResponse(body)), Effect.flip)
+      const response = yield* LLMClient.generate(input).pipe(Effect.provide(fixedResponse(body)))
 
       expect(events).toEqual([
         { type: "step-start", index: 0 },
         { type: "tool-input-start", id: "call_1", name: "lookup", providerMetadata: undefined },
         { type: "tool-input-delta", id: "call_1", name: "lookup", text: '{"query"' },
         { type: "tool-input-delta", id: "call_1", name: "lookup", text: ':"weather"}' },
+        { type: "provider-error", message: "Provider stream ended without a terminal finish event", retryable: true },
       ])
       expect(events.filter(LLMEvent.is.toolCall)).toEqual([])
-      expect(error.message).toContain("Provider stream ended without a terminal finish event")
+      expect(response.finishReason).toBe("error")
+    }),
+  )
+
+  it.effect("surfaces a provider error for text-only stream EOF", () =>
+    Effect.gen(function* () {
+      const events = Array.from(
+        yield* LLMClient.stream(request).pipe(
+          Stream.runCollect,
+          Effect.provide(fixedResponse(sseEvents(deltaChunk({ role: "assistant", content: "Hello" })))),
+        ),
+      )
+
+      expect(events.at(-1)).toEqual({
+        type: "provider-error",
+        message: "Provider stream ended without a terminal finish event",
+        retryable: true,
+      })
+      expect(events.filter(LLMEvent.is.finish)).toEqual([])
     }),
   )
 
   it.effect("fails on malformed stream events", () =>
     Effect.gen(function* () {
-      const body = sseEvents(deltaChunk({ content: 123 }))
-      const error = yield* LLMClient.generate(request).pipe(Effect.provide(fixedResponse(body)), Effect.flip)
+      const events: LLMEvent[] = []
+      const exit = yield* LLMClient.stream(request).pipe(
+        Stream.tap((event) => Effect.sync(() => events.push(event))),
+        Stream.runCollect,
+        Effect.provide(fixedResponse(sseRaw("data: {not json}"))),
+        Effect.exit,
+      )
 
+      expect(events).toEqual([])
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) throw new Error("malformed stream unexpectedly succeeded")
+      const error = exit.cause.reasons.find(Cause.isFailReason)?.error
+      expect(error).toBeInstanceOf(LLMError)
+      if (!(error instanceof LLMError)) return
       expect(error.message).toContain("Invalid openai/openai-chat stream event")
+      expect(error.message).not.toContain("Provider stream ended without a terminal finish event")
+    }),
+  )
+
+  it.effect("preserves explicit in-stream errors without an EOF provider error", () =>
+    Effect.gen(function* () {
+      const events: LLMEvent[] = []
+      const exit = yield* LLMClient.stream(request).pipe(
+        Stream.tap((event) => Effect.sync(() => events.push(event))),
+        Stream.runCollect,
+        Effect.provide(fixedResponse(sseEvents({ error: { message: "Provider failed" } }))),
+        Effect.exit,
+      )
+
+      expect(events).toEqual([])
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) throw new Error("in-stream provider error unexpectedly succeeded")
+      const error = exit.cause.reasons.find(Cause.isFailReason)?.error
+      expect(error).toBeInstanceOf(LLMError)
+      if (!(error instanceof LLMError)) return
+      expect(error.reason).toMatchObject({ _tag: "InvalidProviderOutput" })
+      expect(error.message).toContain("Invalid openai/openai-chat stream event")
+      expect(error.message).not.toContain("Provider stream ended without a terminal finish event")
     }),
   )
 
@@ -630,27 +683,49 @@ describe("OpenAI Chat route", () => {
       const layer = truncatedStream([
         `data: ${JSON.stringify(deltaChunk({ role: "assistant", content: "Hello" }))}\n\n`,
       ])
-      const error = yield* LLMClient.generate(request).pipe(Effect.provide(layer), Effect.flip)
+      const events: LLMEvent[] = []
+      const exit = yield* LLMClient.stream(request).pipe(
+        Stream.tap((event) => Effect.sync(() => events.push(event))),
+        Stream.runCollect,
+        Effect.provide(layer),
+        Effect.exit,
+      )
 
+      expect(events.filter(LLMEvent.is.providerError)).toEqual([])
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) throw new Error("truncated stream unexpectedly succeeded")
+      const error = exit.cause.reasons.find(Cause.isFailReason)?.error
+      expect(error).toBeInstanceOf(LLMError)
+      if (!(error instanceof LLMError)) return
       expect(error.message).toContain("Failed to read openai/openai-chat stream")
+      expect(error.message).not.toContain("Provider stream ended without a terminal finish event")
     }),
   )
 
-  it.effect("fails HTTP provider errors before stream parsing", () =>
+  it.effect("keeps explicit HTTP provider errors unchanged", () =>
     Effect.gen(function* () {
-      const error = yield* LLMClient.generate(request).pipe(
+      const events: LLMEvent[] = []
+      const exit = yield* LLMClient.stream(request).pipe(
+        Stream.tap((event) => Effect.sync(() => events.push(event))),
+        Stream.runCollect,
         Effect.provide(
           fixedResponse('{"error":{"message":"Bad request","type":"invalid_request_error"}}', {
             status: 400,
             headers: { "content-type": "application/json" },
           }),
         ),
-        Effect.flip,
+        Effect.exit,
       )
 
+      expect(events).toEqual([])
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) throw new Error("HTTP provider error unexpectedly succeeded")
+      const error = exit.cause.reasons.find(Cause.isFailReason)?.error
       expect(error).toBeInstanceOf(LLMError)
+      if (!(error instanceof LLMError)) return
       expect(error.reason).toMatchObject({ _tag: "InvalidRequest" })
       expect(error.message).toContain("HTTP 400")
+      expect(error.message).not.toContain("Provider stream ended without a terminal finish event")
     }),
   )
 

@@ -1,13 +1,14 @@
 import type { Effect, Stream } from "effect"
 import type { Endpoint } from "../endpoint"
 import type { Auth } from "../auth"
-import type { Interface as RequestExecutorInterface } from "../executor"
+import type { ExecuteOptions, Interface as RequestExecutorInterface } from "../executor"
 import type { Interface as WebSocketExecutorInterface } from "./websocket"
 import type { LLMError, LLMRequest } from "../../schema"
 
 export interface TransportRuntime {
   readonly http: RequestExecutorInterface
   readonly webSocket?: WebSocketExecutorInterface
+  readonly httpOptions?: ExecuteOptions
 }
 
 export interface Transport<Body, Prepared, Frame> {

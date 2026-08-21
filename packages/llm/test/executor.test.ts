@@ -1,8 +1,8 @@
 import { describe, expect } from "bun:test"
-import { Effect, Fiber, Layer, Random, Ref } from "effect"
+import { Effect, Fiber, Layer, Random, Ref, Stream } from "effect"
 import * as TestClock from "effect/testing/TestClock"
 import { Headers, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
-import { LLM, LLMError } from "../src"
+import { LLM, LLMError, LLMRetry } from "../src"
 import { LLMClient, RequestExecutor } from "../src/route"
 import * as OpenAIChat from "../src/protocols/openai-chat"
 import { dynamicResponse } from "./lib/http"
@@ -265,6 +265,33 @@ describe("RequestExecutor", () => {
     ),
   )
 
+  it.effect("bounds outer provider retries to one HTTP attempt each", () =>
+    Effect.gen(function* () {
+      const attempts = yield* Ref.make(0)
+      return yield* Effect.gen(function* () {
+        const model = OpenAIChat.route
+          .with({ endpoint: { baseURL: "https://api.openai.test/v1" } })
+          .model({ id: "gpt-4o-mini" })
+        const requestToRetry = LLM.request({ model, prompt: "Say hello." })
+        const failures = yield* Effect.forEach(Array.from({ length: LLMRetry.RETRY_MAX_RETRIES + 1 }), () =>
+          LLMClient.stream(requestToRetry, { retries: 0 }).pipe(Stream.runDrain, Effect.flip),
+        )
+
+        expect(failures).toHaveLength(LLMRetry.RETRY_MAX_RETRIES + 1)
+        expect(failures.every((failure) => failure.retryable)).toBe(true)
+        expect(yield* Ref.get(attempts)).toBe(LLMRetry.RETRY_MAX_RETRIES + 1)
+      }).pipe(
+        Effect.provide(
+          dynamicResponse((input) =>
+            Ref.update(attempts, (value) => value + 1).pipe(
+              Effect.as(input.respond("busy", { status: 503, headers: { "retry-after-ms": "0" } })),
+            ),
+          ),
+        ),
+      )
+    }),
+  )
+
   it.effect("marks 504 and 529 status responses retryable", () =>
     Effect.gen(function* () {
       const failWith = (status: number) =>
@@ -379,6 +406,59 @@ describe("RequestExecutor", () => {
           countedResponsesLayer(attempts, [
             new Response("busy", { status: 503, headers: { "retry-after": "2" } }),
             new Response("ok", { status: 200 }),
+          ]),
+        ),
+      )
+    }),
+  )
+
+  it.effect("honors provider retry delays above the local backoff cap", () =>
+    Effect.gen(function* () {
+      const attempts = yield* Ref.make(0)
+      return yield* Effect.gen(function* () {
+        const executor = yield* RequestExecutor.Service
+        const fiber = yield* executor.execute(request).pipe(Effect.forkChild)
+
+        yield* Effect.yieldNow
+        expect(yield* Ref.get(attempts)).toBe(1)
+
+        yield* TestClock.adjust(29_999)
+        yield* Effect.yieldNow
+        expect(yield* Ref.get(attempts)).toBe(1)
+
+        yield* TestClock.adjust(1)
+        const response = yield* Fiber.join(fiber)
+
+        expect(response.status).toBe(200)
+        expect(yield* Ref.get(attempts)).toBe(2)
+      }).pipe(
+        Effect.provide(
+          countedResponsesLayer(attempts, [
+            new Response("busy", { status: 503, headers: { "retry-after": "30" } }),
+            new Response("ok", { status: 200 }),
+          ]),
+        ),
+      )
+    }),
+  )
+
+  it.effect("interrupts a pending provider retry delay", () =>
+    Effect.gen(function* () {
+      const attempts = yield* Ref.make(0)
+      return yield* Effect.gen(function* () {
+        const executor = yield* RequestExecutor.Service
+        const fiber = yield* executor.execute(request).pipe(Effect.forkChild)
+
+        yield* Effect.yieldNow
+        expect(yield* Ref.get(attempts)).toBe(1)
+        yield* Fiber.interrupt(fiber)
+        expect((yield* Fiber.await(fiber))._tag).toBe("Failure")
+        expect(yield* Ref.get(attempts)).toBe(1)
+      }).pipe(
+        Effect.provide(
+          countedResponsesLayer(attempts, [
+            new Response("busy", { status: 503, headers: { "retry-after": "30" } }),
+            new Response("should not retry", { status: 200 }),
           ]),
         ),
       )

@@ -3,6 +3,7 @@ import * as Option from "effect/Option"
 import { Auth, type Auth as AuthDef } from "./auth"
 import { Endpoint, type EndpointPatch } from "./endpoint"
 import { RequestExecutor } from "./executor"
+import type { ExecuteOptions } from "./executor"
 import type { Framing } from "./framing"
 import { HttpTransport } from "./transport"
 import type { Transport, TransportRuntime } from "./transport"
@@ -155,7 +156,7 @@ export interface Interface {
 }
 
 export interface StreamMethod {
-  (request: LLMRequest): Stream.Stream<LLMEvent, LLMError>
+  (request: LLMRequest, options?: ExecuteOptions): Stream.Stream<LLMEvent, LLMError>
 }
 
 export interface GenerateMethod {
@@ -223,6 +224,12 @@ const streamError = (route: string, message: string, cause: Cause.Cause<unknown>
   return ProviderShared.eventError(route, message, Cause.pretty(cause))
 }
 
+const deferStreamFailure = <Event>(stream: Stream.Stream<Event, LLMError>) =>
+  stream.pipe(
+    Stream.map((event) => ({ _tag: "event" as const, event })),
+    Stream.catchCause((cause) => Stream.succeed({ _tag: "failure" as const, cause })),
+  )
+
 function makeFromTransport<Body, Prepared, Frame, Event, State>(
   input: MakeTransportInput<Body, Prepared, Frame, Event, State>,
 ): Route<Body, Prepared> {
@@ -284,10 +291,13 @@ function makeFromTransport<Body, Prepared, Frame, Event, State>(
             Stream.mapEffect(decodeEvent(route)),
             protocol.stream.terminal ? Stream.takeUntil(protocol.stream.terminal) : (stream) => stream,
           )
-        return events.pipe(
+        return deferStreamFailure(events).pipe(
           Stream.mapAccumEffect(
             () => protocol.stream.initial(request),
-            protocol.stream.step,
+            (state, input) => {
+              if (input._tag === "failure") return Effect.failCause(input.cause)
+              return protocol.stream.step(state, input.event)
+            },
             protocol.stream.onHalt ? { onHalt: protocol.stream.onHalt } : undefined,
           ),
           Stream.catchCause((cause) => Stream.fail(streamError(route, `Failed to read ${route} stream`, cause))),
@@ -371,11 +381,11 @@ const prepareWith = Effect.fn("LLMClient.prepare")(function* (request: LLMReques
   })
 })
 
-const streamRequestWith = (runtime: TransportRuntime) => (request: LLMRequest) =>
+const streamRequestWith = (runtime: TransportRuntime) => (request: LLMRequest, options?: ExecuteOptions) =>
   Stream.unwrap(
     Effect.gen(function* () {
       const compiled = yield* compile(request)
-      return compiled.route.streamPrepared(compiled.prepared, compiled.request, runtime)
+      return compiled.route.streamPrepared(compiled.prepared, compiled.request, { ...runtime, httpOptions: options })
     }),
   )
 
@@ -393,10 +403,10 @@ const generateWith = (stream: Interface["stream"]) =>
 export const prepare = <Body = unknown>(request: LLMRequest) =>
   prepareWith(request) as Effect.Effect<PreparedRequestOf<Body>, LLMError>
 
-export function stream(request: LLMRequest): Stream.Stream<LLMEvent, LLMError> {
+export function stream(request: LLMRequest, options?: ExecuteOptions): Stream.Stream<LLMEvent, LLMError> {
   return Stream.unwrap(
     Effect.gen(function* () {
-      return (yield* Service).stream(request)
+      return (yield* Service).stream(request, options)
     }),
   ) as Stream.Stream<LLMEvent, LLMError>
 }

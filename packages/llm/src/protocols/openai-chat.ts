@@ -460,6 +460,9 @@ const step = (state: ParserState, event: OpenAIChatEvent) =>
   })
 
 const finishEvents = (state: ParserState): ReadonlyArray<LLMEvent> => {
+  if (state.finishReason === undefined)
+    return [LLMEvent.providerError({ message: "Provider stream ended without a terminal finish event", retryable: true })]
+
   const events: LLMEvent[] = []
   const hasToolCalls = state.toolCallEvents.length > 0
   const reason = state.finishReason === "stop" && hasToolCalls ? "tool-calls" : state.finishReason
