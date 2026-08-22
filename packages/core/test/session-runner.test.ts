@@ -5,6 +5,7 @@ import {
   LLMEvent,
   AuthenticationReason,
   ProviderInternalReason,
+  StreamIdleTimeoutReason,
   Model,
   TransportReason,
   InvalidRequestReason,
@@ -357,6 +358,16 @@ const providerCapacity = (retryAfterMs = 0) =>
     module: "test",
     method: "stream",
     reason: new ProviderInternalReason({ message: "Service unavailable", status: 503, retryAfterMs }),
+  })
+
+const providerStreamIdleTimeout = () =>
+  new LLMError({
+    module: "test",
+    method: "stream",
+    reason: new StreamIdleTimeoutReason({
+      message: "Provider stream idle timeout after 300 seconds",
+      idleSeconds: 300,
+    }),
   })
 
 const setupOverflowRecovery = Effect.gen(function* () {
@@ -3262,6 +3273,29 @@ describe("SessionRunnerLLM", () => {
       expect(requests).toHaveLength(2)
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "user", text: "Retry capacity" },
+        { type: "assistant", finish: "stop", content: [{ type: "text", text: "Recovered" }] },
+      ])
+    }),
+  )
+
+  it.effect("retries a stream idle timeout before publishing the provider turn", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Retry idle timeout" }), resume: false })
+      const fixture = fragmentFixture("text", "text-idle-timeout-retry", ["Recovered"])
+      const failure = providerStreamIdleTimeout()
+      requests.length = 0
+      responseStreams = [Stream.fail(failure), Stream.fromIterable(fixture.completeEvents)]
+
+      const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      while (requests.length < 1) yield* Effect.yieldNow
+      yield* TestClock.adjust(1_000)
+      yield* Fiber.join(run)
+
+      expect(requests).toHaveLength(2)
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "user", text: "Retry idle timeout" },
         { type: "assistant", finish: "stop", content: [{ type: "text", text: "Recovered" }] },
       ])
     }),

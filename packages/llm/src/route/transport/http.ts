@@ -5,7 +5,7 @@ import { render as renderEndpoint } from "../endpoint"
 import { Framing, type Framing as FramingDef } from "../framing"
 import type { Transport, TransportPrepareInput } from "./index"
 import * as ProviderShared from "../../protocols/shared"
-import { mergeJsonRecords, type LLMRequest } from "../../schema"
+import { LLMError, mergeJsonRecords, StreamIdleTimeoutReason, type LLMRequest } from "../../schema"
 
 export type JsonRequestInput<Body> = TransportPrepareInput<Body>
 
@@ -19,6 +19,26 @@ export interface JsonRequestParts<Body = unknown> {
 export interface HttpPrepared<Frame> {
   readonly request: HttpClientRequest.HttpClientRequest
   readonly framing: FramingDef<Frame>
+}
+
+/** HTTP stream inactivity defaults to 300 seconds; override it with OPENCODE_STREAM_IDLE_TIMEOUT_MS. */
+export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000
+
+const streamIdleTimeoutMs = () => {
+  const configured = Number(typeof process === "undefined" ? undefined : process.env.OPENCODE_STREAM_IDLE_TIMEOUT_MS)
+  return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_STREAM_IDLE_TIMEOUT_MS
+}
+
+const streamIdleTimeoutError = (idleTimeoutMs: number) => {
+  const idleSeconds = idleTimeoutMs / 1000
+  return new LLMError({
+    module: "HttpTransport",
+    method: "stream",
+    reason: new StreamIdleTimeoutReason({
+      message: `Provider stream idle timeout after ${idleSeconds} seconds`,
+      idleSeconds,
+    }),
+  })
 }
 
 const applyQuery = (url: string, query: Record<string, string> | undefined) => {
@@ -129,23 +149,25 @@ export const httpJson = <Body, Frame>(input: HttpJsonInput<Body, Frame>): HttpJs
     ),
   frames: (prepared, request, runtime) =>
     Stream.unwrap(
-      runtime.http
-        .execute(prepared.request, runtime.httpOptions)
-        .pipe(
-          Effect.map((response) =>
-            prepared.framing.frame(
-              response.stream.pipe(
-                Stream.mapError((error) =>
-                  ProviderShared.eventError(
-                    `${request.model.provider}/${request.model.route.id}`,
-                    `Failed to read ${request.model.provider}/${request.model.route.id} stream`,
-                    ProviderShared.errorText(error),
-                  ),
-                ),
+      runtime.http.execute(prepared.request, runtime.httpOptions).pipe(
+        Effect.map((response) => {
+          const idleTimeoutMs = streamIdleTimeoutMs()
+          const body = response.stream.pipe(
+            Stream.mapError((error) =>
+              ProviderShared.eventError(
+                `${request.model.provider}/${request.model.route.id}`,
+                `Failed to read ${request.model.provider}/${request.model.route.id} stream`,
+                ProviderShared.errorText(error),
               ),
             ),
-          ),
-        ),
+            Stream.timeoutOrElse({
+              duration: idleTimeoutMs,
+              orElse: () => Stream.fail(streamIdleTimeoutError(idleTimeoutMs)),
+            }),
+          )
+          return prepared.framing.frame(body)
+        }),
+      ),
     ),
 })
 

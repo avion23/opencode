@@ -119,6 +119,16 @@ export class ProviderInternalReason extends Schema.Class<ProviderInternalReason>
   }
 }
 
+export class StreamIdleTimeoutReason extends Schema.Class<StreamIdleTimeoutReason>("LLM.Error.StreamIdleTimeout")({
+  _tag: Schema.tag("StreamIdleTimeout"),
+  message: Schema.String,
+  idleSeconds: Schema.Number,
+}) {
+  get retryable() {
+    return true
+  }
+}
+
 export class TransportReason extends Schema.Class<TransportReason>("LLM.Error.Transport")({
   _tag: Schema.tag("Transport"),
   message: Schema.String,
@@ -165,6 +175,7 @@ export const LLMErrorReason = Schema.Union([
   QuotaExceededReason,
   ContentPolicyReason,
   ProviderInternalReason,
+  StreamIdleTimeoutReason,
   TransportReason,
   InvalidProviderOutputReason,
   UnknownProviderReason,
