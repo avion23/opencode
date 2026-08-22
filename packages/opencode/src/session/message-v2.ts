@@ -1,6 +1,7 @@
 import { SessionID, MessageID } from "./schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { LLMError } from "@opencode-ai/llm"
 import {
   APIError,
   AbortedError,
@@ -699,6 +700,14 @@ export function fromError(
           responseHeaders: parsed.responseHeaders,
           responseBody: parsed.responseBody,
           metadata: parsed.metadata,
+        },
+        { cause: e },
+      ).toObject()
+    case e instanceof LLMError && e.retryable:
+      return new APIError(
+        {
+          message: e.message,
+          isRetryable: e.retryable,
         },
         { cause: e },
       ).toObject()

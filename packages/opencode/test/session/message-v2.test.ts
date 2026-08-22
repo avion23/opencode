@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { APICallError } from "ai"
+import { LLMError, StreamIdleTimeoutReason } from "@opencode-ai/llm"
 import { MessageV2 } from "../../src/session/message-v2"
 import { SessionRetry } from "../../src/session/retry"
 import { ProviderTransform } from "@/provider/transform"
@@ -1620,6 +1621,24 @@ describe("session.message-v2.fromError", () => {
     const result = MessageV2.fromError(new Error("Bad Request"), { providerID })
     expect(result.name).toBe("UnknownError")
     expect(result.data).toStrictEqual({ message: "Bad Request" })
+  })
+
+  test("serializes retryable LLM errors as retryable APIError", () => {
+    const error = new LLMError({
+      module: "HttpTransport",
+      method: "stream",
+      reason: new StreamIdleTimeoutReason({
+        message: "Provider stream idle timeout after 300 seconds",
+        idleSeconds: 300,
+      }),
+    })
+    const result = MessageV2.fromError(error, { providerID })
+
+    expect(result.name).not.toBe("UnknownError")
+    expect(SessionV1.APIError.isInstance(result)).toBe(true)
+    if (!SessionV1.APIError.isInstance(result)) return
+    expect(result.data.isRetryable).toBe(true)
+    expect(SessionRetry.retryable(result, "test")).toEqual({ message: error.message })
   })
 
   test("classifies retryable AI SDK failures with retry-after details", () => {
