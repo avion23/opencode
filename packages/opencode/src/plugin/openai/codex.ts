@@ -5,7 +5,9 @@ import os from "os"
 import { setTimeout as sleep } from "node:timers/promises"
 import { createServer } from "http"
 import { OpenAIWebSocketPool } from "./ws-pool"
+import { OpenAIWebSocket } from "./ws"
 import { OauthCallbackPage } from "@opencode-ai/core/oauth/page"
+import { isRecord } from "@/util/record"
 
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 const ISSUER = "https://auth.openai.com"
@@ -14,6 +16,8 @@ const OAUTH_PORT = 1455
 const OAUTH_POLLING_SAFETY_MARGIN_MS = 3000
 const ALLOWED_MODELS = new Set(["gpt-5.5", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini"])
 const DISALLOWED_MODELS = new Set(["gpt-5.5-pro"])
+const RESPONSES_LITE_MODELS = new Set(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "codex-auto-review"])
+const UUID_NAMESPACE_OID = "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
 
 interface PkceCodes {
   verifier: string
@@ -33,6 +37,119 @@ function base64UrlEncode(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer)
   const binary = String.fromCharCode(...bytes)
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
+}
+
+async function uuidV5(namespace: string, value: string) {
+  const bytes = new TextEncoder().encode(value)
+  const input = new Uint8Array(16 + bytes.length)
+  input.set(uuidBytes(namespace))
+  input.set(bytes, 16)
+  const hash = new Uint8Array(await crypto.subtle.digest("SHA-1", input))
+  hash[6] = (hash[6] & 0x0f) | 0x50
+  hash[8] = (hash[8] & 0x3f) | 0x80
+  const hex = Array.from(hash, (byte) => byte.toString(16).padStart(2, "0")).join("")
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`
+}
+
+async function responseItemId(prefix: string, namespace: string, value: string) {
+  return `${prefix}_${await uuidV5(namespace, value)}`
+}
+
+function uuidBytes(value: string) {
+  const hex = value.replaceAll("-", "")
+  return new Uint8Array(
+    Array.from({ length: 16 }, (_, index) => Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16)),
+  )
+}
+
+async function transformResponsesLiteBody(
+  body: BodyInit | null | undefined,
+  sessionID: string | undefined,
+): Promise<string | undefined> {
+  if (typeof body !== "string") return undefined
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    return undefined
+  }
+  if (!isRecord(parsed) || typeof parsed.model !== "string" || !RESPONSES_LITE_MODELS.has(parsed.model))
+    return undefined
+
+  const input = Array.isArray(parsed.input) ? parsed.input : []
+  const sourceTools = Array.isArray(parsed.tools) ? parsed.tools : []
+  const tools: unknown[] = []
+  const functions: unknown[] = []
+  let functionsDescription = ""
+  let functionsIndex: number | undefined
+
+  for (const tool of sourceTools) {
+    if (isRecord(tool) && (tool.type === "function" || tool.type === "custom")) {
+      functionsIndex ??= tools.length
+      functions.push(tool)
+      continue
+    }
+    if (isRecord(tool) && tool.type === "namespace" && tool.name === "functions") {
+      functionsIndex ??= tools.length
+      if (typeof tool.description === "string" && tool.description.trim().length > 0) {
+        functionsDescription = tool.description
+      }
+      if (Array.isArray(tool.tools)) functions.push(...tool.tools)
+      continue
+    }
+    tools.push(tool)
+  }
+
+  if (functionsIndex !== undefined && functions.length > 0) {
+    tools.splice(functionsIndex, 0, {
+      type: "namespace",
+      name: "functions",
+      description: functionsDescription,
+      tools: functions,
+    })
+  }
+
+  const prefixNamespace = await uuidV5(
+    UUID_NAMESPACE_OID,
+    sessionID ?? (typeof parsed.prompt_cache_key === "string" ? parsed.prompt_cache_key : ""),
+  )
+  const prefix: unknown[] = [
+    {
+      id: await responseItemId("at", prefixNamespace, JSON.stringify(tools)),
+      type: "additional_tools",
+      role: "developer",
+      tools,
+    },
+  ]
+  if (typeof parsed.instructions === "string" && parsed.instructions.length > 0) {
+    prefix.push({
+      id: await responseItemId("msg", prefixNamespace, parsed.instructions),
+      type: "message",
+      role: "developer",
+      content: [{ type: "input_text", text: parsed.instructions }],
+      internal_chat_message_metadata_passthrough: {
+        content_item_kinds: ["model.base_instructions"],
+      },
+    })
+  }
+
+  parsed.input = [...prefix, ...input]
+  delete parsed.instructions
+  delete parsed.tools
+  parsed.tool_choice = "auto"
+  parsed.parallel_tool_calls = false
+  parsed.store = false
+  parsed.reasoning = {
+    ...(isRecord(parsed.reasoning) ? parsed.reasoning : {}),
+    context: "all_turns",
+  }
+
+  const include = Array.isArray(parsed.include) ? [...parsed.include] : []
+  if (!include.includes("reasoning.encrypted_content")) include.push("reasoning.encrypted_content")
+  parsed.include = include
+
+  return JSON.stringify(parsed)
 }
 
 export interface IdTokenClaims {
@@ -426,9 +543,20 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
               if (residency) headers.set("x-openai-internal-codex-residency", residency)
             }
 
+            const responsesLiteBody = parsed.pathname.endsWith("/responses")
+              ? await transformResponsesLiteBody(
+                  init?.body,
+                  headers.get("x-session-affinity") ??
+                    headers.get("x-session-id") ??
+                    headers.get("session-id") ??
+                    undefined,
+                )
+              : undefined
+            if (responsesLiteBody) headers.set(OpenAIWebSocket.RESPONSES_LITE_HEADER, "true")
+
             const requestInit = {
               ...init,
-              body: init?.body,
+              body: responsesLiteBody ?? init?.body,
               headers,
             }
             if (websocketFetch && parsed.pathname.endsWith("/responses")) return websocketFetch(url, requestInit)

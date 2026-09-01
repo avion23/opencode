@@ -85,7 +85,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       entry.socket = await socket(
         entry,
         options?.url ?? url,
-        OpenAIWebSocket.normalizeHeaders(httpInit?.headers),
+        websocketHeaders(httpInit?.headers),
         connectTimeout,
         maxConnectionAge,
         init?.signal,
@@ -98,7 +98,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       })
       const response = OpenAIWebSocket.streamResponsesWebSocket({
         socket: entry.socket,
-        body,
+        body: websocketRequestBody(body, internalHeaders),
         idleTimeout,
         signal: init?.signal ?? undefined,
         onFirstEvent: (error) => resolveFirstEvent(error ?? true),
@@ -198,6 +198,23 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
 function connectionLimitError(event: Record<string, unknown>) {
   if (event.type !== "error" || !isRecord(event.error) || event.error.code !== CONNECTION_LIMIT_REACHED_CODE) return
   return new Error(typeof event.error.message === "string" ? event.error.message : CONNECTION_LIMIT_REACHED_CODE)
+}
+
+function websocketHeaders(headers: HeadersInit | undefined) {
+  const result = OpenAIWebSocket.normalizeHeaders(headers)
+  delete result[OpenAIWebSocket.RESPONSES_LITE_HEADER]
+  return result
+}
+
+function websocketRequestBody(body: Record<string, unknown>, headers: Record<string, string>) {
+  if (headers[OpenAIWebSocket.RESPONSES_LITE_HEADER] !== "true") return body
+  return {
+    ...body,
+    client_metadata: {
+      ...(isRecord(body.client_metadata) ? body.client_metadata : {}),
+      [OpenAIWebSocket.RESPONSES_LITE_CLIENT_METADATA_KEY]: "true",
+    },
+  }
 }
 
 function failedResponse(error: ProviderError.ResponseStreamError) {

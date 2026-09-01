@@ -9,6 +9,8 @@ import { ProxyEnv } from "@/util/proxy-env"
 import { isRecord } from "@/util/record"
 
 export const PROTOCOL_HEADER = "responses_websockets=2026-02-06"
+export const RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
+export const RESPONSES_LITE_CLIENT_METADATA_KEY = "ws_request_header_x_openai_internal_codex_responses_lite"
 export const MESSAGE_TOO_BIG_CLOSE_CODE = 1009
 
 export interface ConnectResponsesWebSocketOptions {
