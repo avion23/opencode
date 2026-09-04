@@ -7,6 +7,10 @@ import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import { Session } from "@/session/session"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { EventV2 } from "@opencode-ai/core/event"
+import { Database } from "@opencode-ai/core/database/database"
+import { WorkspaceTable } from "@opencode-ai/core/control-plane/workspace.sql"
+import { EventSequenceTable } from "@opencode-ai/core/event/sql"
+import { eq } from "drizzle-orm"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, requireInstance, TestInstance } from "../fixture/fixture"
 import { withFixedWorkspaceID } from "../fixture/flag"
@@ -31,6 +35,20 @@ function insertWorkspaceRow(id: WorkspaceV2.ID) {
     )
   })
 }
+
+// Durable ownership: the projection (Session.workspaceID) can recover from the
+// event stream, but only event_sequence.owner_id fences later steals.
+const sequenceOwner = (sessionID: string) =>
+  Effect.gen(function* () {
+    const rows = yield* Database.Service.use(({ db }) =>
+      db
+        .select({ owner_id: EventSequenceTable.owner_id })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, sessionID))
+        .pipe(Effect.orDie),
+    )
+    return rows[0]?.owner_id
+  })
 
 afterEach(async () => {
   mock.restore()
@@ -204,6 +222,7 @@ describe("sync HttpApi", () => {
         })
         expect(stale.status).toBe(409)
         expect((yield* Session.use.get(session.id)).workspaceID).toBeUndefined()
+        expect(yield* sequenceOwner(session.id)).toBe(workspaceID)
 
         const committed = yield* requestInDirectory(SyncPaths.steal, tmp.directory, {
           method: "POST",
@@ -223,13 +242,17 @@ describe("sync HttpApi", () => {
         expect(retried.status).toBe(200)
         expect(yield* retried.json).toEqual(result)
 
+        // D5: a warp commit is only recoverable by its exact warp event. A
+        // fresh warpID after the warp already committed is a conflict, and
+        // ownership survives the rejected steal.
         const recovered = yield* requestInDirectory(SyncPaths.steal, tmp.directory, {
           method: "POST",
           headers,
           body: JSON.stringify({ sessionID: session.id, seq: 0, warpID: EventV2.ID.create(), ownerID: workspaceID }),
         })
-        expect(recovered.status).toBe(200)
-        expect(yield* recovered.json).toEqual(result)
+        expect(recovered.status).toBe(409)
+        expect((yield* Session.use.get(session.id)).workspaceID).toBe(workspaceID)
+        expect(yield* sequenceOwner(session.id)).toBe(workspaceID)
       }),
     { git: true, config: { formatter: false, lsp: false } },
   )
