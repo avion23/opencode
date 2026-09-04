@@ -205,7 +205,14 @@ export default { path: file, version: ${JSON.stringify(opencodePty.version)}, sh
     process.exit(1)
   }
   verifySimulationGraph(simulationInputs)
-  await NativeArch.verify(path.join(outdir, name, "bin", item.os === "win32" ? `${binary}.exe` : binary), item.arch)
+  const builtBinary = path.join(outdir, name, "bin", item.os === "win32" ? `${binary}.exe` : binary)
+  await NativeArch.verify(builtBinary, item.arch)
+
+  if (item.os === "darwin" && process.platform === "darwin") {
+    // Bun's linker signature can fail macOS validation after a local binary is copied.
+    await $`codesign --force --sign - ${builtBinary}`
+    await $`codesign --verify --strict ${builtBinary}`
+  }
 
   await Bun.write(
     path.join(outdir, name, "package.json"),
