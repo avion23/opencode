@@ -201,9 +201,15 @@ for (const item of targets) {
     },
   })
 
+  const binaryPath = `dist/${name}/bin/opencode`
+  if (item.os === "darwin" && process.platform === "darwin") {
+    // Bun's linker signature can fail macOS validation after a local binary is copied.
+    await $`codesign --force --sign - ${binaryPath}`
+    await $`codesign --verify --strict ${binaryPath}`
+  }
+
   // Smoke test: only run if binary is for current platform
   if (item.os === process.platform && item.arch === process.arch && !item.abi) {
-    const binaryPath = `dist/${name}/bin/opencode`
     console.log(`Running smoke test: ${binaryPath} --version`)
     try {
       const versionOutput = await $`${binaryPath} --version`.text()
