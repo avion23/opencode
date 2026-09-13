@@ -39,3 +39,4 @@ tsconfig.tsbuildinfo
 /artifacts/
 .opencode/
 handoff.md
+fleet.md
