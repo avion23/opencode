@@ -1,7 +1,8 @@
 - After changing the public Protocol or Server `HttpApi`, run `bun run generate` from `packages/client`. Do not edit generated client files directly.
 - Keep runtime dependencies directed from Schema to Core and Protocol, then from Core and Protocol to Server. Client runtime code may depend on Schema and Protocol but never Core or Server; `sdk` composes Client, Core, and Server.
 - This repository does not use Changesets. Do not add `.changeset` files; follow the existing release workflow instead.
-- The default branch is `dev`. Base branches and worktrees on `origin/dev`, target PRs at `dev`, and diff against `origin/dev` unless told otherwise.
+- The default branch is `dev`. Base branches and worktrees on `origin/dev`, and diff against `origin/dev` unless told otherwise.
+- Never open, submit, or offer pull requests anywhere, including upstream `anomalyco/opencode`. This is a private fork: keep commits on local branches and push only to the fork's `origin`, and only when explicitly asked. Do not file issues or comment on upstream issues without an explicit user request.
 
 ## Live TUI Testing
 
