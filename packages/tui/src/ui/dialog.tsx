@@ -2,7 +2,7 @@ import { useRenderer, useTerminalDimensions } from "@opentui/solid"
 import { batch, createContext, createEffect, onCleanup, Show, useContext, type JSX, type ParentProps } from "solid-js"
 import { Keymap } from "../context/keymap"
 import { ThemeContextProvider, useTheme } from "../context/theme"
-import { InputRenderable, MouseButton, Renderable, RGBA } from "@opentui/core"
+import { InputRenderable, MouseButton, Renderable, RGBA, TextAttributes } from "@opentui/core"
 import { createStore } from "solid-js/store"
 import { useToast } from "./toast"
 import { useClipboard } from "../context/clipboard"
@@ -10,6 +10,12 @@ import { useConfig } from "../config"
 import { copy, copyOnSelectRelease } from "../util/selection"
 
 export type DialogSize = "medium" | "large" | "xlarge"
+
+export const DIALOG_PADDING_X = 4
+
+export const DIALOG_INSET = 3
+// List rows reserve a 1-cell gutter for the ▌ bar / ● marker.
+export const DIALOG_LIST_INSET = DIALOG_INSET + 1
 
 export function dialogWidth(size: DialogSize) {
   if (size === "xlarge") return 116
@@ -70,6 +76,40 @@ export function Dialog(
       </box>
       </box>
     </ThemeContextProvider>
+  )
+}
+
+export function DialogHeader(
+  props: ParentProps<{
+    title?: JSX.Element
+    titleView?: JSX.Element
+    closeLabel?: string
+    onClose?: () => void
+    gap?: number
+    paddingX?: number
+    newInset?: number
+  }>,
+) {
+  const dialog = useDialog()
+  const theme = useTheme().surface("dialog")
+  return (
+    <box
+      flexDirection="row"
+      justifyContent="space-between"
+      gap={props.gap}
+      paddingLeft={props.newInset ?? props.paddingX}
+      paddingRight={props.newInset ?? props.paddingX}
+    >
+      {props.titleView ?? (
+        <text attributes={TextAttributes.BOLD} fg={theme.text.base}>
+          {props.title}
+        </text>
+      )}
+      {props.children}
+      <text fg={theme.text.muted} flexShrink={0} onMouseUp={() => (props.onClose ?? dialog.clear)()}>
+        {props.closeLabel ?? "esc"}
+      </text>
+    </box>
   )
 }
 
