@@ -1,6 +1,6 @@
 import { Keymap } from "../context/keymap"
 import { useTheme } from "../context/theme"
-import { DialogHeader, useDialog } from "./dialog"
+import { DialogHeader, DialogLayout, useDialog } from "./dialog"
 
 export function DialogHelp() {
   const dialog = useDialog()
@@ -16,23 +16,25 @@ export function DialogHelp() {
   }))
 
   return (
-    <box paddingLeft={2} paddingRight={2} gap={1}>
-      <DialogHeader title="Help" closeLabel="esc/enter" />
-      <box paddingBottom={1}>
-        <text fg={theme.text.muted}>
-          Press {shortcuts.get("command.palette.show")} to see all available actions and commands in any context.
-        </text>
-      </box>
-      <box flexDirection="row" justifyContent="flex-end" paddingBottom={1}>
-        <box
-          paddingLeft={3}
-          paddingRight={3}
-          backgroundColor={theme.background.action.primary.focused}
-          onMouseUp={() => dialog.clear()}
-        >
-          <text fg={theme.text.action.primary.focused}>ok</text>
+    <DialogLayout
+      header={<DialogHeader title="Help" closeLabel="esc/enter" />}
+      footer={{ actions: { primary: [{ title: "ok", key: "enter", onTrigger: () => dialog.clear() }] } }}
+      legacyFooter={
+        <box flexDirection="row" justifyContent="flex-end">
+          <box
+            paddingLeft={3}
+            paddingRight={3}
+            backgroundColor={theme.background.action.primary.focused}
+            onMouseUp={() => dialog.clear()}
+          >
+            <text fg={theme.text.action.primary.focused}>ok</text>
+          </box>
         </box>
-      </box>
-    </box>
+      }
+    >
+      <text fg={theme.text.muted}>
+        Press {shortcuts.get("command.palette.show")} to see all available actions and commands in any context.
+      </text>
+    </DialogLayout>
   )
 }
